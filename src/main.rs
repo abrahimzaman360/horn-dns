@@ -60,6 +60,9 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+mod lock;
+use lock::{DEFAULT_PIN, LockState, hash_pin};
+
 // ───────────────────────────── assets ─────────────────────────────
 
 // Kit's default source only embeds 101 icons; pick exactly the extra Lucide ones we use.
@@ -100,7 +103,9 @@ icon_assets!(
         Battery,
         BatteryCharging,
         Ellipsis,
-        LogOut
+        Lock,
+        Power,
+        Delete
     ]
 );
 
@@ -451,6 +456,12 @@ struct Config {
     tile_borders: bool,
     #[serde(default)]
     app_sort: AppSort,
+    #[serde(default = "default_pin_hash")]
+    pin_hash: Option<String>,
+    #[serde(default = "default_pin_len")]
+    pin_len: usize,
+    #[serde(default)]
+    lock_wallpaper: Option<String>,
     #[serde(default = "default_brightness")]
     brightness: f32,
     /// Start-screen tiles in display order; the first-fit packer places them.
@@ -503,6 +514,14 @@ fn default_live_enabled() -> bool {
 
 fn default_brightness() -> f32 {
     1.0
+}
+
+fn default_pin_hash() -> Option<String> {
+    Some(format!("{:016x}", hash_pin(DEFAULT_PIN)))
+}
+
+fn default_pin_len() -> usize {
+    4
 }
 
 fn default_tile_size() -> TileSize {
@@ -640,6 +659,9 @@ impl Default for Config {
             auto_adjust_tiles: true,
             tile_borders: false,
             app_sort: AppSort::Category,
+            pin_hash: default_pin_hash(),
+            pin_len: 4,
+            lock_wallpaper: None,
             brightness: 1.0,
             tiles: default_tiles(),
         }
@@ -657,6 +679,10 @@ impl Config {
             tile.manual_y = tile.manual_y.map(|y| y.clamp(0.0, MAX_MANUAL_ROWS as f32));
         }
         self.brightness = self.brightness.clamp(0.05, 1.0);
+        self.pin_len = self.pin_len.clamp(4, 6);
+        self.lock_wallpaper = self
+            .lock_wallpaper
+            .filter(|path| resolve_wallpaper(path).is_some());
         self.wallpaper_file = self
             .wallpaper_file
             .filter(|path| resolve_wallpaper(path).is_some());
@@ -1030,6 +1056,9 @@ struct Metro {
     search_pending: bool,
     app_sort: AppSort,
     app_sort_menu: bool,
+    lock: LockState,
+    boot_visible: bool,
+    shutdown_confirm: bool,
     // tile editing / long-press on the Start screen
     editing: bool,
     tile_hold: Option<TileHold>,
@@ -1053,6 +1082,12 @@ impl Metro {
         let config = load_config().unwrap_or_default();
         let tiles = tiles_from_config(&config.tiles);
         let next_id = tiles.len();
+        let lock = LockState::new(
+            config.pin_hash.clone(),
+            config.pin_len,
+            config.lock_wallpaper.as_deref(),
+            resolve_wallpaper,
+        );
 
         // 1 Hz heartbeat: clock + live-tile flips
         cx.spawn(async move |this, cx| {
@@ -1062,6 +1097,33 @@ impl Metro {
                     break;
                 }
             }
+        })
+        .detach();
+
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(7000))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.boot_visible = false;
+                this.lock.lock_now();
+                this.lock.locked = true;
+                this.launch = None;
+                this.panel = None;
+                this.panel_closing = false;
+                this.switcher = false;
+                this.switcher_closing = false;
+                this.edit = None;
+                this.editing = false;
+                this.tile_menu = None;
+                this.add_sheet = false;
+                this.history.clear();
+                this.page = Page::Start;
+                this.prev_page = None;
+                this.page_morph = false;
+                this.nav += 1;
+                cx.notify();
+            });
         })
         .detach();
 
@@ -1111,8 +1173,7 @@ impl Metro {
             night_light: false,
             battery_saver: false,
             notes_cleared: false,
-            // A few apps "already running" so the switcher has something to show.
-            running: vec![2, 8, 6],
+            running: Vec::new(),
             switcher: false,
             switcher_closing: false,
             switcher_token: 0,
@@ -1134,6 +1195,9 @@ impl Metro {
             search_pending: false,
             app_sort: config.app_sort,
             app_sort_menu: false,
+            lock,
+            boot_visible: true,
+            shutdown_confirm: false,
             editing: false,
             tile_hold: None,
             hold_token: 0,
@@ -1439,6 +1503,13 @@ impl Metro {
             auto_adjust_tiles: self.auto_adjust_tiles,
             tile_borders: self.tile_borders,
             app_sort: self.app_sort,
+            pin_hash: self.lock.pin_hash.map(|hash| format!("{hash:016x}")),
+            pin_len: self.lock.pin_len,
+            lock_wallpaper: self
+                .lock
+                .wallpaper
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
             brightness: self.brightness,
             tiles: self
                 .tiles
@@ -1492,6 +1563,7 @@ impl Metro {
         self.tile_borders = defaults.tile_borders;
         self.app_sort = defaults.app_sort;
         self.app_sort_menu = false;
+        self.lock.reset_defaults();
         self.brightness = defaults.brightness;
         self.editing = false;
         self.edit = None;
@@ -1505,7 +1577,7 @@ impl Metro {
     // ── navigation ──
 
     fn go(&mut self, page: Page, cx: &mut Context<Self>) {
-        if self.page == page {
+        if self.lock.locked || self.page == page {
             return;
         }
         self.history.push(self.page);
@@ -1564,6 +1636,9 @@ impl Metro {
     }
 
     fn back(&mut self, cx: &mut Context<Self>) {
+        if self.lock_back(cx) {
+            return;
+        }
         if self.launch.is_some() {
             return;
         }
@@ -1581,6 +1656,32 @@ impl Metro {
             self.flip_to(prev, cx);
         } else {
             cx.notify();
+        }
+    }
+
+    fn lock_now(&mut self, cx: &mut Context<Self>) {
+        self.lock.lock_now();
+        self.panel = None;
+        self.panel_closing = false;
+        self.switcher = false;
+        self.launch = None;
+        self.edit = None;
+        self.editing = false;
+        self.save_soon(cx);
+        cx.notify();
+    }
+
+    fn lock_back(&mut self, cx: &mut Context<Self>) -> bool {
+        if self.lock.locked {
+            if self.lock.pin_prompt {
+                self.lock.back_to_overlay();
+            } else {
+                self.lock.backspace();
+            }
+            cx.notify();
+            true
+        } else {
+            false
         }
     }
 
@@ -1604,11 +1705,22 @@ impl Metro {
     }
 
     fn open_app(&mut self, app: usize, cx: &mut Context<Self>) {
-        // Dismiss any panel immediately; the page flip covers the switch.
+        if self.boot_visible || self.lock.locked {
+            return;
+        }
         self.panel = None;
         self.panel_closing = false;
         self.panel_token += 1;
-        self.go(page_for(app), cx);
+        self.begin_launch(
+            Launch {
+                app,
+                tile: None,
+                from: (0, 0),
+                rect: (MARGIN, STATUS_H + 72.0, 46.0, 46.0),
+                n: 0,
+            },
+            cx,
+        );
     }
 
     fn toggle_pin(&mut self, app: usize, cx: &mut Context<Self>) {
@@ -1692,7 +1804,7 @@ impl Metro {
     /// Phase 2: the app page is swapped in underneath, the plate fades out and the
     /// app's own content slides in.
     fn begin_launch(&mut self, mut l: Launch, cx: &mut Context<Self>) {
-        if self.launch.is_some() {
+        if self.boot_visible || self.lock.locked || self.launch.is_some() {
             return;
         }
         self.launch_n += 1;
@@ -1725,6 +1837,11 @@ impl Metro {
 
     /// Swap straight to the app page (no page peel — the launch plate covers the switch).
     fn commit_open(&mut self, app: usize, cx: &mut Context<Self>) {
+        if self.boot_visible || self.lock.locked {
+            self.launch = None;
+            cx.notify();
+            return;
+        }
         let page = page_for(app);
         self.switcher = false;
         self.switcher_closing = false;
@@ -1961,7 +2078,7 @@ impl Metro {
                     });
                     this.edit = Some(hold.id);
                     this.editing = true;
-                    this.tile_menu = None;
+                    this.tile_menu = Some(TileMenu { id: hold.id });
                     cx.notify();
                 }
             });
@@ -2544,8 +2661,21 @@ impl Metro {
                     .child("Ibrahim Zaman"),
             );
 
-        let logout = div()
-            .id("system-profile-logout")
+        let lock = div()
+            .id("system-profile-lock")
+            .size(px(34.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(self.cell_bg())
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(|this, _, _, cx| this.lock_now(cx)))
+            .child(glyph(IconName::Lock, 16.0, fg));
+
+        let shutdown = div()
+            .id("system-profile-shutdown")
             .size(px(34.0))
             .flex()
             .items_center()
@@ -2555,10 +2685,11 @@ impl Metro {
             .cursor_pointer()
             .active(|s| s.opacity(0.6))
             .on_click(cx.listener(|this, _, _, cx| {
+                this.shutdown_confirm = true;
                 this.close_panel(cx);
-                this.home(cx);
+                cx.notify();
             }))
-            .child(glyph(IconName::LogOut, 16.0, fg));
+            .child(glyph(IconName::Power, 16.0, fg));
 
         let settings = div()
             .id("system-profile-settings")
@@ -2601,7 +2732,8 @@ impl Metro {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
-                    .child(logout)
+                    .child(lock)
+                    .child(shutdown)
                     .child(settings)
                     .child(dismiss),
             );
@@ -3481,7 +3613,7 @@ impl Metro {
                     .line_height(px(32.0))
                     .font_weight(FontWeight::LIGHT)
                     .text_color(white())
-                    .child("running apps"),
+                    .child("Running Apps"),
             );
 
         let scrim = div()
@@ -3854,20 +3986,18 @@ impl Metro {
             )
             .child(
                 div()
-                    .w(px(54.0))
-                    .h(px(11.0))
+                    .w(px(18.0))
+                    .h(px(18.0))
                     .flex()
-                    .items_end()
+                    .items_center()
                     .justify_center()
                     .child(
                         div()
-                            .w(px(36.0))
-                            .h(px(6.0))
-                            .border_t_1()
-                            .border_l_1()
-                            .border_r_1()
-                            .border_color(fg.opacity(0.50))
-                            .rounded_t(px(8.0)),
+                            .size(px(10.0))
+                            .rounded_full()
+                            .bg(hsla(0.0, 0.0, 0.02, 1.0))
+                            .border_1()
+                            .border_color(hsla(0.0, 0.0, 0.12, 1.0)),
                     ),
             )
             .child(
@@ -4679,13 +4809,7 @@ impl Metro {
             .flex()
             .items_center()
             .justify_between()
-            .child(
-                div()
-                    .text_size(px(54.0))
-                    .line_height(px(60.0))
-                    .font_weight(FontWeight::LIGHT)
-                    .child("Apps"),
-            )
+            .child(div().size(px(0.0)))
             .child(
                 div()
                     .id("apps-sort-menu")
@@ -4719,6 +4843,618 @@ impl Metro {
                     .child(search)
                     .children(list),
             )
+    }
+
+    fn lock_settings_section(&self, cx: &mut Context<Self>) -> Div {
+        let fg = self.fg();
+        let enabled = self.lock.pin_hash.is_some();
+        let toggle = div()
+            .id("lock-enable")
+            .w_full()
+            .h(px(44.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.lock.set_enabled(!this.lock.pin_hash.is_some());
+                this.save_soon(cx);
+                cx.notify();
+            }))
+            .child(div().text_size(px(13.0)).child("Screen Lock"))
+            .child(
+                div()
+                    .w(px(38.0))
+                    .h(px(22.0))
+                    .rounded_full()
+                    .bg(if enabled {
+                        rgb(self.accent).into()
+                    } else {
+                        self.cell_bg()
+                    })
+                    .flex()
+                    .items_center()
+                    .when(enabled, |d| d.justify_end())
+                    .when(!enabled, |d| d.justify_start())
+                    .child(div().mx(px(3.0)).size(px(16.0)).rounded_full().bg(fg)),
+            );
+
+        let mut lengths = Vec::new();
+        for len in [4usize, 5, 6] {
+            let selected = self.lock.pin_len == len;
+            lengths.push(
+                div()
+                    .id(("lock-length", len))
+                    .flex_1()
+                    .h(px(36.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(2.0))
+                    .cursor_pointer()
+                    .active(|s| s.opacity(0.6))
+                    .bg(if selected {
+                        rgb(self.accent).into()
+                    } else {
+                        self.cell_bg()
+                    })
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.lock.pin_len = len;
+                        this.lock.entry.clear();
+                        this.save_soon(cx);
+                        cx.notify();
+                    }))
+                    .child(div().text_size(px(12.0)).child(format!("{len}-digit PIN"))),
+            );
+        }
+
+        div()
+            .w_full()
+            .flex()
+            .flex_col()
+            .child(toggle)
+            .child(div().mt(px(8.0)).flex().gap(px(6.0)).children(lengths))
+    }
+
+    fn lock_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.boot_visible || !self.lock.locked {
+            return None;
+        }
+        let fg = white();
+        let background = match self
+            .lock
+            .wallpaper
+            .as_ref()
+            .or(self.wallpaper_file.as_ref())
+        {
+            Some(path) => div()
+                .absolute()
+                .size_full()
+                .bg(hsla(0.0, 0.0, 0.03, 1.0))
+                .child(img(path.clone()).object_fit(ObjectFit::Cover).size_full())
+                .into_any_element(),
+            None => div()
+                .absolute()
+                .size_full()
+                .bg(hsla(0.0, 0.0, 0.03, 1.0))
+                .into_any_element(),
+        };
+
+        let date = self.date.clone();
+        let time = self.time.clone();
+        let weather = div()
+            .flex()
+            .items_end()
+            .gap(px(8.0))
+            .child(glyph(IconName::Sun, 26.0, fg))
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(30.0))
+                            .line_height(px(32.0))
+                            .font_weight(FontWeight::LIGHT)
+                            .text_color(fg)
+                            .child("24°"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(fg.opacity(0.72))
+                            .child("Sunny"),
+                    ),
+            );
+
+        let calendar = div()
+            .flex()
+            .items_center()
+            .gap(px(12.0))
+            .child(
+                div()
+                    .text_size(px(30.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .text_color(fg)
+                    .child("18"),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg)
+                            .child("Design review"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .text_color(fg.opacity(0.72))
+                            .child("4:30 PM"),
+                    ),
+            );
+
+        let mut notification_widgets: Vec<AnyElement> = Vec::new();
+        for (i, note) in NOTES.iter().take(5).enumerate() {
+            let app = &APPS[note.app];
+            let app_index = note.app;
+            notification_widgets.push(
+                div()
+                    .id(("lock-widget", i as u32))
+                    .relative()
+                    .size(px(54.0))
+                    .rounded(px(3.0))
+                    .bg(rgb(app.color.unwrap_or(self.accent)))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|s| s.opacity(0.6))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if !this.lock.locked {
+                            this.open_app(app_index, cx);
+                        }
+                    }))
+                    .child(glyph(
+                        app.icon,
+                        24.0,
+                        on_color(app.color.unwrap_or(self.accent)),
+                    ))
+                    .into_any_element(),
+            );
+        }
+
+        let pin_fg = white();
+        let mut pin_dots = Vec::with_capacity(self.lock.pin_len);
+        for i in 0..self.lock.pin_len {
+            pin_dots.push(
+                div()
+                    .w(px(22.0))
+                    .h(px(22.0))
+                    .border_1()
+                    .border_color(pin_fg.opacity(0.82))
+                    .rounded_full()
+                    .bg(if i < self.lock.entry.len() {
+                        pin_fg
+                    } else {
+                        hsla(0.0, 0.0, 1.0, 0.08)
+                    }),
+            );
+        }
+
+        let mut pin_keys: Vec<AnyElement> = Vec::with_capacity(12);
+        for (slot, digit) in ["1", "2", "3", "4", "5", "6", "7", "8", "9"]
+            .into_iter()
+            .enumerate()
+        {
+            pin_keys.push(
+                div()
+                    .id(("lock-pin-key", slot as u32))
+                    .size(px(76.0))
+                    .rounded_full()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .border_1()
+                    .border_color(pin_fg.opacity(0.34))
+                    .cursor_pointer()
+                    .active(|s| s.opacity(0.55))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(ch) = digit.chars().next() {
+                            this.lock.add_digit(ch);
+                            if this.lock.entry.len() == this.lock.pin_len {
+                                this.lock.verify();
+                            }
+                        }
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(28.0))
+                            .font_weight(FontWeight::LIGHT)
+                            .text_color(pin_fg)
+                            .child(digit),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let pin_surface = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .bg(hsla(0.0, 0.0, 0.02, 1.0))
+            .flex()
+            .flex_col()
+            .items_center()
+            .justify_center()
+            .pt(px(72.0))
+            .pb(px(72.0))
+            .child(
+                div()
+                    .text_size(px(64.0))
+                    .line_height(px(68.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .text_color(pin_fg)
+                    .child(time.clone()),
+            )
+            .child(
+                div()
+                    .mt(px(4.0))
+                    .text_size(px(15.0))
+                    .text_color(pin_fg.opacity(0.78))
+                    .child(date.clone()),
+            )
+            .child(
+                div()
+                    .mt(px(46.0))
+                    .text_size(px(13.0))
+                    .text_color(if self.lock.error {
+                        hsla(0.0, 0.80, 0.72, 1.0)
+                    } else {
+                        pin_fg.opacity(0.82)
+                    })
+                    .child(if self.lock.error {
+                        "Try again"
+                    } else {
+                        "Enter PIN"
+                    }),
+            )
+            .child(div().mt(px(18.0)).flex().gap(px(14.0)).children(pin_dots))
+            .child(
+                div()
+                    .mt(px(38.0))
+                    .w(px(268.0))
+                    .flex()
+                    .flex_wrap()
+                    .justify_center()
+                    .gap(px(18.0))
+                    .children(pin_keys)
+                    .child(
+                        div()
+                            .id("lock-pin-back")
+                            .size(px(76.0))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|s| s.opacity(0.55))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.lock.back_to_overlay();
+                                cx.notify();
+                            }))
+                            .child(glyph(IconName::Lock, 22.0, pin_fg)),
+                    )
+                    .child(
+                        div()
+                            .id("lock-pin-zero")
+                            .size(px(76.0))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .border_1()
+                            .border_color(pin_fg.opacity(0.34))
+                            .cursor_pointer()
+                            .active(|s| s.opacity(0.55))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.lock.add_digit('0');
+                                if this.lock.entry.len() == this.lock.pin_len {
+                                    this.lock.verify();
+                                }
+                                cx.notify();
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(28.0))
+                                    .font_weight(FontWeight::LIGHT)
+                                    .text_color(pin_fg)
+                                    .child("0"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("lock-pin-delete")
+                            .size(px(76.0))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .cursor_pointer()
+                            .active(|s| s.opacity(0.55))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.lock.backspace();
+                                cx.notify();
+                            }))
+                            .child(glyph(IconName::X, 22.0, pin_fg)),
+                    ),
+            );
+
+        let drag_offset = self.lock.swipe_offset;
+        let unlock_offset = if self.lock.unlocking { self.vh } else { 0.0 };
+        let drag_progress = (self.lock.swipe_offset / (self.vh * 0.50).max(1.0)).clamp(0.0, 1.0);
+        let overlay_content_opacity = 1.0 - drag_progress;
+        let lock_screen = div()
+            .id("lock-screen")
+            .absolute()
+            .left(px(0.0))
+            .top(px(-drag_offset - unlock_offset))
+            .size_full()
+            .overflow_hidden()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                    if !this.lock.pin_prompt {
+                        this.lock.begin_swipe(f32::from(e.position.y));
+                        cx.notify();
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                if this.lock.swipe_start.is_some() {
+                    this.lock.move_swipe(f32::from(e.position.y));
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    if this.lock.swipe_start.is_some() {
+                        this.lock.end_swipe(this.vh);
+                        cx.notify();
+                    }
+                    let _ = e;
+                }),
+            )
+            .child(background)
+            .child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .top(px(0.0))
+                    .size_full()
+                    .bg(linear_gradient(
+                        180.0,
+                        linear_color_stop(hsla(0.0, 0.0, 0.0, 0.10), 0.0),
+                        linear_color_stop(hsla(0.0, 0.0, 0.0, 0.55), 1.0),
+                    )),
+            )
+            .child(
+                div()
+                    .relative()
+                    .size_full()
+                    .px(px(MARGIN))
+                    .opacity(overlay_content_opacity)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(MARGIN))
+                            .bottom(px(46.0))
+                            .flex()
+                            .flex_col()
+                            .child(
+                                div()
+                                    .text_size(px(64.0))
+                                    .line_height(px(68.0))
+                                    .font_weight(FontWeight::LIGHT)
+                                    .text_color(fg)
+                                    .child(time),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(2.0))
+                                    .text_size(px(16.0))
+                                    .font_weight(FontWeight::LIGHT)
+                                    .text_color(fg.opacity(0.92))
+                                    .child(date.clone()),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(30.0))
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(26.0))
+                                    .child(weather)
+                                    .child(calendar),
+                            )
+                            .child(
+                                div()
+                                    .mt(px(32.0))
+                                    .w(px(330.0))
+                                    .flex()
+                                    .flex_wrap()
+                                    .gap(px(22.0))
+                                    .children(notification_widgets),
+                            ),
+                    )
+                    .when(!self.lock.pin_prompt, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left(px(0.0))
+                                .bottom(px(12.0))
+                                .w_full()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(8.0))
+                                .child(
+                                    div()
+                                        .w(px(34.0))
+                                        .h(px(2.0))
+                                        .rounded_full()
+                                        .bg(fg.opacity(0.78)),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0))
+                                        .text_color(fg.opacity(0.68))
+                                        .child("Swipe up"),
+                                ),
+                        )
+                    }),
+            );
+
+        let stack = div()
+            .id("lock-stack")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .overflow_hidden()
+            .child(pin_surface);
+
+        if self.lock.spring_back {
+            let drag_offset = self.lock.swipe_offset;
+            Some(
+                stack
+                    .child(lock_screen.with_animation(
+                        ("lock-spring-back", self.lock.spring_back_n),
+                        Animation::new(Duration::from_millis(420)).with_easing(ease_out_quint()),
+                        move |el, progress| el.top(px(-drag_offset * (1.0 - progress))),
+                    ))
+                    .into_any_element(),
+            )
+        } else if self.lock.overlay_revealing {
+            let vh = self.vh;
+            let drag_offset = self.lock.swipe_offset;
+            Some(
+                stack
+                    .child(lock_screen.with_animation(
+                        ("lock-reveal", self.lock.overlay_return_n + 1),
+                        Animation::new(Duration::from_millis(520)).with_easing(ease_out_quint()),
+                        move |el, progress| {
+                            let final_offset = vh;
+                            let top = drag_offset + (final_offset - drag_offset) * progress;
+                            el.top(px(-top))
+                        },
+                    ))
+                    .into_any_element(),
+            )
+        } else if self.lock.overlay_returning {
+            let vh = self.vh;
+            Some(
+                stack
+                    .child(lock_screen.with_animation(
+                        ("lock-return", self.lock.overlay_return_n),
+                        Animation::new(Duration::from_millis(360)).with_easing(ease_out_quint()),
+                        move |el, progress| el.top(px(-vh * (1.0 - progress))),
+                    ))
+                    .into_any_element(),
+            )
+        } else if self.lock.pin_prompt {
+            Some(stack.into_any_element())
+        } else if unlock_offset > 0.0 {
+            Some(
+                stack
+                    .child(lock_screen.with_animation(
+                        ("lock-unlock", self.lock.unlock_n),
+                        Animation::new(Duration::from_millis(360)).with_easing(ease_out_quint()),
+                        move |el, progress| el.top(px(-unlock_offset * progress)),
+                    ))
+                    .into_any_element(),
+            )
+        } else {
+            Some(stack.child(lock_screen).into_any_element())
+        }
+    }
+
+    fn lock_prepare(&mut self, _window: &mut Window, cx: &mut Context<Self>) {
+        if self.lock.spring_back && !self.lock.spring_back_scheduled {
+            self.lock.spring_back_scheduled = true;
+            let token = self.lock.spring_back_n;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(420))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.lock.spring_back && this.lock.spring_back_n == token {
+                        this.lock.finish_spring_back();
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        if self.lock.overlay_revealing && !self.lock.overlay_reveal_scheduled {
+            self.lock.overlay_reveal_scheduled = true;
+            let token = self.lock.overlay_return_n.wrapping_add(1);
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(520))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.lock.overlay_revealing
+                        && this.lock.overlay_return_n.wrapping_add(1) == token
+                    {
+                        this.lock.overlay_revealing = false;
+                        this.lock.overlay_reveal_scheduled = false;
+                        this.lock.swipe_offset = 0.0;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        if self.lock.overlay_returning && !self.lock.overlay_return_scheduled {
+            self.lock.overlay_return_scheduled = true;
+            let token = self.lock.overlay_return_n;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(360))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.lock.overlay_returning && this.lock.overlay_return_n == token {
+                        this.lock.finish_overlay_return();
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
+        if self.lock.unlocking && !self.lock.unlock_scheduled {
+            self.lock.unlock_scheduled = true;
+            let token = self.lock.unlock_n;
+            cx.spawn(async move |this, cx| {
+                cx.background_executor()
+                    .timer(Duration::from_millis(360))
+                    .await;
+                let _ = this.update(cx, |this, cx| {
+                    if this.lock.unlocking && this.lock.unlock_n == token {
+                        this.lock.complete_unlock();
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
+        }
     }
 
     fn app_sort_menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
@@ -5154,6 +5890,8 @@ impl Metro {
                     .child(tile_borders_toggle)
                     .child(caption("Tile Gap"))
                     .child(gap)
+                    .child(caption("Lock Screen"))
+                    .child(self.lock_settings_section(cx))
                     .child(reset),
             )
     }
@@ -5338,7 +6076,56 @@ impl Render for Metro {
         self.relayout(width);
         let me = cx.entity();
 
+        if self.boot_visible {
+            return div()
+                .id("lumen-boot-root")
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(hsla(0.0, 0.0, 0.02, 1.0))
+                .occlude()
+                .child(
+                    div()
+                        .text_size(px(44.0))
+                        .font_weight(FontWeight::LIGHT)
+                        .text_color(white())
+                        .child("LUMEN OS.Y"),
+                )
+                .with_animation(
+                    ("lumen-boot-root", 1u32),
+                    Animation::new(Duration::from_millis(7000)).with_easing(ease_out_quint()),
+                    |el, d| {
+                        let opacity = if d < 0.16 {
+                            d / 0.16
+                        } else if d > 0.72 {
+                            ((1.0 - d) / 0.28).clamp(0.0, 1.0)
+                        } else {
+                            1.0
+                        };
+                        el.opacity(opacity)
+                    },
+                )
+                .into_any_element();
+        }
+
+        if self.lock.locked {
+            let lock_layer = self.lock_layer(cx);
+            return div()
+                .id("lumen-lock-root")
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .size_full()
+                .when_some(lock_layer, |d, layer| d.child(layer))
+                .into_any_element();
+        }
+
         self.maybe_focus_search(window, cx);
+        self.lock_prepare(window, cx);
 
         let page = self.page_element(self.page, true, window, cx);
         let page_backdrop = if self.page == Page::Start {
@@ -5350,7 +6137,7 @@ impl Render for Metro {
         let flip = self.page_flip(width, window, cx);
 
         let dim = (1.0 - self.brightness) * 0.6;
-        let status_bar = self.status_bar(cx);
+        let status_bar = (!self.lock.locked).then(|| self.status_bar(cx));
         let switcher_layer = self.switcher_layer(window, cx);
         let launch_layer = self.launch_layer(width);
         let panel_layer = self.panel_layer(window, cx);
@@ -5358,6 +6145,92 @@ impl Render for Metro {
         let add_sheet = self.add_sheet_layer(cx);
         let tile_menu = self.tile_menu_layer(cx);
         let app_sort_menu = self.app_sort_menu_layer(cx);
+        let lock_layer = self.lock_layer(cx);
+        let shutdown_confirm = self.shutdown_confirm.then(|| {
+            let fg = self.fg();
+            div()
+                .id("shutdown-dialog")
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .size_full()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(hsla(0.0, 0.0, 0.0, 0.58))
+                .occlude()
+                .child(
+                    div()
+                        .w(px(300.0))
+                        .p(px(20.0))
+                        .rounded(px(6.0))
+                        .bg(self.panel_bg())
+                        .border_1()
+                        .border_color(fg.opacity(0.18))
+                        .shadow_lg()
+                        .flex()
+                        .flex_col()
+                        .gap(px(18.0))
+                        .child(
+                            div()
+                                .text_size(px(20.0))
+                                .font_weight(FontWeight::LIGHT)
+                                .text_color(fg)
+                                .child("Shut down Lumen OS.Y?"),
+                        )
+                        .child(
+                            div()
+                                .w_full()
+                                .flex()
+                                .gap(px(10.0))
+                                .child(
+                                    div()
+                                        .id("shutdown-cancel")
+                                        .flex_1()
+                                        .h(px(40.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.0))
+                                        .bg(self.cell_bg())
+                                        .cursor_pointer()
+                                        .active(|s| s.opacity(0.6))
+                                        .on_click(cx.listener(|this, _, _, cx| {
+                                            this.shutdown_confirm = false;
+                                            cx.notify();
+                                        }))
+                                        .child(
+                                            div()
+                                                .text_size(px(12.0))
+                                                .text_color(fg)
+                                                .child("Cancel"),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("shutdown-confirm")
+                                        .flex_1()
+                                        .h(px(40.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded(px(3.0))
+                                        .bg(rgb(0xE51400))
+                                        .cursor_pointer()
+                                        .active(|s| s.opacity(0.6))
+                                        .on_click(cx.listener(|_, _, _, cx| {
+                                            cx.shutdown();
+                                        }))
+                                        .child(
+                                            div()
+                                                .text_size(px(12.0))
+                                                .text_color(white())
+                                                .child("Shut down"),
+                                        ),
+                                ),
+                        ),
+                )
+        });
 
         // While a pull or a slider drag is in progress, a transparent layer sits above the
         // (pointer-occluding) panel so the gesture keeps receiving move / up events.
@@ -5442,6 +6315,8 @@ impl Render for Metro {
             .when_some(switcher_layer, |d, layer| d.child(layer))
             // App launch zoom plate, above the switcher so cards can zoom open too.
             .when_some(launch_layer, |d, layer| d.child(layer))
+            // PIN lock screen sits above app content and every transient panel.
+            .when_some(lock_layer, |d, layer| d.child(layer))
             // Screen brightness: dim everything below the panels.
             .when(dim > 0.001, |d| {
                 d.child(
@@ -5461,7 +6336,46 @@ impl Render for Metro {
             .when_some(tile_menu, |d, menu| d.child(menu))
             .when_some(app_sort_menu, |d, menu| d.child(menu))
             .when_some(catcher, |d, c| d.child(c))
-            .child(status_bar)
+            .when_some(status_bar, |d, bar| d.child(bar))
+            .when_some(shutdown_confirm, |d, dialog| d.child(dialog))
+            .when(self.boot_visible, |d| {
+                d.child(
+                    div()
+                        .id("lumen-boot")
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .size_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(hsla(0.0, 0.0, 0.02, 1.0))
+                        .occlude()
+                        .child(
+                            div()
+                                .text_size(px(44.0))
+                                .font_weight(FontWeight::LIGHT)
+                                .text_color(white())
+                                .child("LUMEN OS.Y"),
+                        )
+                        .with_animation(
+                            ("lumen-boot", 1u32),
+                            Animation::new(Duration::from_millis(7000))
+                                .with_easing(ease_out_quint()),
+                            |el, d| {
+                                let opacity = if d < 0.16 {
+                                    d / 0.16
+                                } else if d > 0.72 {
+                                    ((1.0 - d) / 0.28).clamp(0.0, 1.0)
+                                } else {
+                                    1.0
+                                };
+                                el.opacity(opacity)
+                            },
+                        ),
+                )
+            })
+            .into_any_element()
     }
 }
 
