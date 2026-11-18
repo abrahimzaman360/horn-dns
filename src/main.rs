@@ -98,7 +98,9 @@ icon_assets!(
         BellOff,
         Moon,
         Battery,
-        BatteryCharging
+        BatteryCharging,
+        Ellipsis,
+        LogOut
     ]
 );
 
@@ -140,6 +142,7 @@ const PANEL_PAD: f32 = 20.0; // panel inner margin
 const STATUS_H: f32 = 26.0; // status bar height (always the top layer)
 const NAV_H: f32 = 52.0; // bottom navigation bar height
 const TILE_ALPHA_MIN: f32 = 0.30; // most transparent a tile may get
+const MAX_MANUAL_ROWS: u32 = 200; // limits corrupted configs from creating an unbounded canvas
 const WINDOW_WIDTH: f32 = 476.0; // main (host) window width; height fills the screen
 
 // Motion constants (ms)
@@ -419,7 +422,7 @@ static NOTES: &[Note] = &[
 // ───────────────────────────── persisted config ─────────────────────────────
 
 /// Bumped when the on-disk shape needs migrating.
-const CONFIG_VERSION: u32 = 1;
+const CONFIG_VERSION: u32 = 2;
 
 /// Everything that survives a restart. Stored as pretty JSON so it is easy to
 /// hand-edit; unknown or broken values fall back to the defaults below.
@@ -440,6 +443,14 @@ struct Config {
     gap: f32,
     #[serde(default = "default_alpha")]
     tile_alpha: f32,
+    #[serde(default)]
+    liquid_glass: bool,
+    #[serde(default = "default_auto_adjust")]
+    auto_adjust_tiles: bool,
+    #[serde(default)]
+    tile_borders: bool,
+    #[serde(default)]
+    app_sort: AppSort,
     #[serde(default = "default_brightness")]
     brightness: f32,
     /// Start-screen tiles in display order; the first-fit packer places them.
@@ -454,6 +465,12 @@ struct TileConfig {
     app: String,
     #[serde(default = "default_tile_size")]
     size: TileSize,
+    #[serde(default = "default_live_enabled")]
+    live_enabled: bool,
+    #[serde(default)]
+    manual_x: Option<f32>,
+    #[serde(default)]
+    manual_y: Option<f32>,
 }
 
 fn config_version() -> u32 {
@@ -474,6 +491,14 @@ fn default_gap() -> f32 {
 
 fn default_alpha() -> f32 {
     1.0
+}
+
+fn default_auto_adjust() -> bool {
+    true
+}
+
+fn default_live_enabled() -> bool {
+    true
 }
 
 fn default_brightness() -> f32 {
@@ -508,6 +533,9 @@ fn default_tiles() -> Vec<TileConfig> {
     .map(|(app, size)| TileConfig {
         app: app.to_string(),
         size,
+        live_enabled: true,
+        manual_x: None,
+        manual_y: None,
     })
     .collect()
 }
@@ -608,6 +636,10 @@ impl Default for Config {
             wallpaper_file: None,
             gap: DEFAULT_GAP,
             tile_alpha: 1.0,
+            liquid_glass: false,
+            auto_adjust_tiles: true,
+            tile_borders: false,
+            app_sort: AppSort::Category,
             brightness: 1.0,
             tiles: default_tiles(),
         }
@@ -620,6 +652,10 @@ impl Config {
         self.wallpaper = self.wallpaper.min(WALLPAPER_NAMES.len() - 1);
         self.gap = self.gap.clamp(GAP_MIN, GAP_MAX);
         self.tile_alpha = self.tile_alpha.clamp(TILE_ALPHA_MIN, 1.0);
+        for tile in &mut self.tiles {
+            tile.manual_x = tile.manual_x.map(|x| x.clamp(0.0, 1.0));
+            tile.manual_y = tile.manual_y.map(|y| y.clamp(0.0, MAX_MANUAL_ROWS as f32));
+        }
         self.brightness = self.brightness.clamp(0.05, 1.0);
         self.wallpaper_file = self
             .wallpaper_file
@@ -689,12 +725,15 @@ fn save_config(config: &Config) {
 fn tiles_from_config(configs: &[TileConfig]) -> Vec<Tile> {
     configs
         .iter()
-        .filter_map(|tc| app_index(&tc.app).map(|app| (app, tc.size)))
+        .filter_map(|tc| app_index(&tc.app).map(|app| (app, tc)))
         .enumerate()
-        .map(|(i, (app, size))| {
-            let mut tile = Tile::new(app, size, default_faces(app), default_badge(app));
+        .map(|(i, (app, tc))| {
+            let mut tile = Tile::new(app, tc.size, default_faces(app), default_badge(app));
             tile.id = i;
             tile.offset = (i as u64 * 5) % 6;
+            tile.live_enabled = tc.live_enabled;
+            tile.manual_x = tc.manual_x;
+            tile.manual_y = tc.manual_y;
             tile
         })
         .collect()
@@ -753,6 +792,9 @@ struct Tile {
     prev: usize,
     tick: usize,
     offset: u64,
+    live_enabled: bool,
+    manual_x: Option<f32>,
+    manual_y: Option<f32>,
 }
 
 impl Tile {
@@ -767,6 +809,9 @@ impl Tile {
             prev: 0,
             tick: 0,
             offset: 0,
+            live_enabled: true,
+            manual_x: None,
+            manual_y: None,
         }
     }
 }
@@ -777,6 +822,14 @@ enum Page {
     Apps,
     Settings,
     App(usize),
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize, Default, Debug)]
+#[serde(rename_all = "lowercase")]
+enum AppSort {
+    #[default]
+    Category,
+    Alphabetical,
 }
 
 /// The page that shows a given app.
@@ -872,8 +925,6 @@ struct TileHold {
 #[derive(Clone, Copy)]
 struct TileMenu {
     id: usize,
-    x: f32,
-    y: f32,
 }
 
 /// Payload carried while a tile is being dragged. Also renders the drag "ghost".
@@ -945,6 +996,9 @@ struct Metro {
     pull_y: f32,
     drag: Option<Drag>,
     brightness: f32,
+    liquid_glass: bool,
+    auto_adjust_tiles: bool,
+    tile_borders: bool,
     wifi: bool,
     bluetooth: bool,
     airplane: bool,
@@ -968,10 +1022,14 @@ struct Metro {
     wallpaper: usize,
     gap: f32,
     tile_alpha: f32,
+    // Last root-relative pointer position, used to place manual tile drops.
+    pointer: (f32, f32),
     // app search
     search: String,
     search_focus: FocusHandle,
     search_pending: bool,
+    app_sort: AppSort,
+    app_sort_menu: bool,
     // tile editing / long-press on the Start screen
     editing: bool,
     tile_hold: Option<TileHold>,
@@ -1043,6 +1101,9 @@ impl Metro {
             pull_y: 0.0,
             drag: None,
             brightness: config.brightness,
+            liquid_glass: config.liquid_glass,
+            auto_adjust_tiles: config.auto_adjust_tiles,
+            tile_borders: config.tile_borders,
             wifi: true,
             bluetooth: false,
             airplane: false,
@@ -1067,9 +1128,12 @@ impl Metro {
             wallpaper_files: scan_wallpapers(),
             gap: config.gap,
             tile_alpha: config.tile_alpha,
+            pointer: (0.0, 0.0),
             search: String::new(),
             search_focus: cx.focus_handle(),
             search_pending: false,
+            app_sort: config.app_sort,
+            app_sort_menu: false,
             editing: false,
             tile_hold: None,
             hold_token: 0,
@@ -1100,7 +1164,7 @@ impl Metro {
         if self.edit.is_none() && !self.editing {
             let secs = self.secs;
             for t in self.tiles.iter_mut() {
-                if t.faces.len() > 1 && (secs + t.offset) % 6 == 0 {
+                if t.live_enabled && t.faces.len() > 1 && (secs + t.offset).is_multiple_of(6) {
                     t.prev = t.idx;
                     t.idx = (t.idx + 1) % t.faces.len();
                     t.tick += 1;
@@ -1160,9 +1224,9 @@ impl Metro {
                 }
             }
             let (c, r) = spot.unwrap();
-            for rr in r..r + ch {
-                for cc in c..c + cw {
-                    occ[rr][cc] = true;
+            for row in occ.iter_mut().skip(r).take(ch) {
+                for cell in row.iter_mut().skip(c).take(cw) {
+                    *cell = true;
                 }
             }
             out.push((c, r));
@@ -1173,6 +1237,126 @@ impl Metro {
             .map(|i| i + 1)
             .unwrap_or(0);
         (out, rows)
+    }
+
+    /// Manual tile positions are fractions of available horizontal travel and vertical grid rows.
+    fn tile_layout(&self) -> (Vec<(f32, f32)>, usize) {
+        let (packed, packed_rows) = self.pack();
+        if self.auto_adjust_tiles {
+            return (
+                packed
+                    .into_iter()
+                    .zip(self.tiles.iter())
+                    .map(|((col, row), tile)| {
+                        let max_col = self.cols.saturating_sub(tile.size.cells().0).max(1);
+                        (col as f32 / max_col as f32, row as f32)
+                    })
+                    .collect(),
+                packed_rows,
+            );
+        }
+
+        let mut positions = Vec::with_capacity(self.tiles.len());
+        let mut rows = 0usize;
+        for (tile, (col, row)) in self.tiles.iter().zip(packed) {
+            let x = tile.manual_x.unwrap_or_else(|| {
+                let max_col = self.cols.saturating_sub(tile.size.cells().0).max(1);
+                col as f32 / max_col as f32
+            });
+            let y = tile.manual_y.unwrap_or(row as f32);
+            let height = tile.size.cells().1 as f32;
+            rows = rows.max((y.ceil() as usize).saturating_add(height as usize));
+            positions.push((x, y));
+        }
+        (positions, rows)
+    }
+
+    fn seed_new_manual_position(&mut self, id: usize) {
+        let Some(ix) = self.tiles.iter().position(|tile| tile.id == id) else {
+            return;
+        };
+        let (cw, ch) = self.tiles[ix].size.cells();
+        let current = self.tile_layout().0;
+        let max_col = self.cols.saturating_sub(cw).max(1);
+        for row in 0..MAX_MANUAL_ROWS as usize {
+            for col in 0..=self.cols.saturating_sub(cw) {
+                let left = col as f32;
+                let top = row as f32;
+                let occupied = self.tiles.iter().enumerate().any(|(other_ix, other)| {
+                    if other_ix == ix {
+                        return false;
+                    }
+                    let (ow, oh) = other.size.cells();
+                    let (ox, oy) = current[other_ix];
+                    let oleft = ox * self.cols.saturating_sub(ow).max(1) as f32;
+                    left < oleft + ow as f32
+                        && left + cw as f32 > oleft
+                        && top < oy + oh as f32
+                        && top + ch as f32 > oy
+                });
+                if !occupied {
+                    self.tiles[ix].manual_x = Some(left / max_col as f32);
+                    self.tiles[ix].manual_y = Some(top);
+                    return;
+                }
+            }
+        }
+    }
+
+    fn resize_tile(&mut self, id: usize, size: TileSize, cx: &mut Context<Self>) {
+        let Some(ix) = self.tiles.iter().position(|tile| tile.id == id) else {
+            return;
+        };
+        let old_cols = self.tiles[ix].size.cells().0;
+        let old_x = self.tiles[ix].manual_x;
+        let (new_cols, _) = size.cells();
+        if let Some(x) = old_x {
+            let step = self.cell + self.gap;
+            let old_left = x * (self.cols.saturating_sub(old_cols) as f32) * step;
+            let new_max = (self.cols.saturating_sub(new_cols) as f32) * step;
+            self.tiles[ix].manual_x = Some(if new_max > 0.0 {
+                (old_left / new_max).clamp(0.0, 1.0)
+            } else {
+                0.0
+            });
+        }
+        self.tiles[ix].size = size;
+        self.save_soon(cx);
+        cx.notify();
+    }
+
+    fn seed_manual_positions(&mut self) {
+        let packed = self.pack().0;
+        for (tile, (col, row)) in self.tiles.iter_mut().zip(packed) {
+            let max_col = self.cols.saturating_sub(tile.size.cells().0).max(1);
+            tile.manual_x.get_or_insert(col as f32 / max_col as f32);
+            tile.manual_y.get_or_insert(row as f32);
+        }
+    }
+
+    fn place_tile_at_pointer(&mut self, id: usize, cx: &mut Context<Self>) {
+        let Some(ix) = self.tiles.iter().position(|tile| tile.id == id) else {
+            return;
+        };
+        let tile = &self.tiles[ix];
+        let (cw, ch) = tile.size.cells();
+        let cell_step = self.cell + self.gap;
+        let canvas_x = self.pointer.0 - TILE_MARGIN;
+        let canvas_y = self.pointer.1 - STATUS_H - 8.0 - f32::from(self.start_scroll.offset().y);
+        let max_x = (self.cols as f32 - cw as f32).max(0.0) * cell_step;
+        let x = (canvas_x / max_x.max(1.0)).clamp(0.0, 1.0);
+        let y = (canvas_y / cell_step)
+            .max(0.0)
+            .min(MAX_MANUAL_ROWS as f32 - ch as f32);
+        self.tiles[ix].manual_x = Some(x);
+        self.tiles[ix].manual_y = Some(y);
+        // Move the dropped tile to the end of the render list so it appears above
+        // overlapping tiles instead of being painted underneath them.
+        let moved = self.tiles.remove(ix);
+        self.tiles.push(moved);
+        self.edit = None;
+        self.save_soon(cx);
+        cx.notify();
     }
 
     /// Animated value for any keyed channel. While the window itself is being resized the
@@ -1251,6 +1435,10 @@ impl Metro {
                 .map(|path| path.to_string_lossy().to_string()),
             gap: self.gap,
             tile_alpha: self.tile_alpha,
+            liquid_glass: self.liquid_glass,
+            auto_adjust_tiles: self.auto_adjust_tiles,
+            tile_borders: self.tile_borders,
+            app_sort: self.app_sort,
             brightness: self.brightness,
             tiles: self
                 .tiles
@@ -1258,6 +1446,9 @@ impl Metro {
                 .map(|t| TileConfig {
                     app: APPS[t.app].name.to_string(),
                     size: t.size,
+                    live_enabled: t.live_enabled,
+                    manual_x: t.manual_x,
+                    manual_y: t.manual_y,
                 })
                 .collect(),
         }
@@ -1296,6 +1487,11 @@ impl Metro {
         self.wallpaper_file = None;
         self.gap = defaults.gap;
         self.tile_alpha = defaults.tile_alpha;
+        self.liquid_glass = defaults.liquid_glass;
+        self.auto_adjust_tiles = defaults.auto_adjust_tiles;
+        self.tile_borders = defaults.tile_borders;
+        self.app_sort = defaults.app_sort;
+        self.app_sort_menu = false;
         self.brightness = defaults.brightness;
         self.editing = false;
         self.edit = None;
@@ -1429,6 +1625,9 @@ impl Metro {
             self.next_id += 1;
             t.offset = self.secs;
             self.tiles.push(t);
+            if !self.auto_adjust_tiles {
+                self.seed_new_manual_position(self.next_id - 1);
+            }
         }
         self.save_soon(cx);
         cx.notify();
@@ -1438,7 +1637,7 @@ impl Metro {
 
     /// Start the launch splash for a tapped Start tile.
     fn launch_from_tile(&mut self, id: usize, cx: &mut Context<Self>) {
-        let (layout, _) = self.pack();
+        let (layout, _) = self.tile_layout();
         let Some(ix) = self.tiles.iter().position(|t| t.id == id) else {
             return;
         };
@@ -1446,8 +1645,9 @@ impl Metro {
         let (c, r) = layout[ix];
         let (cw, ch) = t.size.cells();
         let (cell, g) = (self.cell, self.gap);
-        let x = TILE_MARGIN + c as f32 * (cell + g);
-        let y = STATUS_H + 8.0 + r as f32 * (cell + g) + f32::from(self.start_scroll.offset().y);
+        let max_x = (self.cols as f32 - cw as f32).max(0.0) * (cell + g);
+        let x = TILE_MARGIN + c * max_x;
+        let y = STATUS_H + 8.0 + r * (cell + g) + f32::from(self.start_scroll.offset().y);
         let w = cw as f32 * cell + (cw as f32 - 1.0) * g;
         let h = ch as f32 * cell + (ch as f32 - 1.0) * g;
         let app = t.app;
@@ -1455,7 +1655,7 @@ impl Metro {
             Launch {
                 app,
                 tile: Some(id),
-                from: (c, r),
+                from: (c.round() as usize, r.round() as usize),
                 rect: (x, y, w, h),
                 n: 0,
             },
@@ -1655,7 +1855,7 @@ impl Metro {
             cw,
             ch: (cw * 1.4).round(),
             gap,
-            top: 64.0,
+            top: 52.0,
         }
     }
 
@@ -1668,8 +1868,11 @@ impl Metro {
 
     // ── panels ──
 
-    fn panel_height_for(viewport_h: f32) -> f32 {
-        (viewport_h * 0.66).clamp(320.0, 560.0)
+    fn panel_height_for(viewport_h: f32, kind: PanelKind) -> f32 {
+        match kind {
+            PanelKind::System => 332.0_f32.min(viewport_h - STATUS_H).max(300.0),
+            PanelKind::Notifications => (viewport_h * 0.66).clamp(320.0, 560.0),
+        }
     }
 
     fn open_panel(&mut self, kind: PanelKind, cx: &mut Context<Self>) {
@@ -1829,6 +2032,7 @@ impl Metro {
                 self.empty_hold = None;
             }
         }
+        self.pointer = (f32::from(e.position.x), f32::from(e.position.y));
         if let Some(drag) = self.drag {
             self.apply_drag(drag, f32::from(e.position.x));
             cx.notify();
@@ -1854,6 +2058,7 @@ impl Metro {
     }
 
     fn pointer_up(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.pointer = (x, y);
         self.home_press = None;
         self.empty_hold = None;
         // Finish a tile press: a drag ends the selection, a long-press without a
@@ -1868,7 +2073,7 @@ impl Metro {
                 // Long-pressed in place: this release opens the size menu, so the
                 // click that follows must not launch the app.
                 self.suppress_click = Some(hold.id);
-                self.tile_menu = Some(TileMenu { id: hold.id, x, y });
+                self.tile_menu = Some(TileMenu { id: hold.id });
             }
             cx.notify();
         }
@@ -1877,7 +2082,7 @@ impl Metro {
             // Release: keep the panel if it was pulled far enough, else spring it back.
             self.pulling = false;
             self.pull_start = None;
-            let ph = Self::panel_height_for(self.vh);
+            let ph = Self::panel_height_for(self.vh, self.panel.unwrap_or(PanelKind::System));
             if self.pull_y > ph * PULL_COMMIT {
                 self.panel_closing = false;
             } else {
@@ -1901,8 +2106,8 @@ impl Metro {
     fn apply_drag(&mut self, kind: Drag, x: f32) {
         let (left, track) = match kind {
             Drag::Brightness => (
-                PANEL_PAD + 34.0,
-                (self.measured_w - 2.0 * PANEL_PAD - 34.0 - 92.0).max(1.0),
+                PANEL_PAD,
+                (self.measured_w - 2.0 * PANEL_PAD - 12.0 - 20.0).max(1.0),
             ),
             Drag::Gap | Drag::Opacity => {
                 let avail = (self.measured_w - 2.0 * MARGIN).max(0.0);
@@ -1986,6 +2191,24 @@ impl Metro {
                 cx.notify();
             }))
             .child(glyph(icon, 21.0, ink))
+            .when(active, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .top(px(7.0))
+                        .right(px(7.0))
+                        .size(px(18.0))
+                        .rounded_full()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .bg(ink)
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(rgb(self.accent))
+                        .child("✓"),
+                )
+            })
             .child(
                 div()
                     .text_size(px(11.0))
@@ -2092,9 +2315,25 @@ impl Metro {
         &self,
         overline: &'static str,
         title: &'static str,
+        with_settings: bool,
         cx: &mut Context<Self>,
     ) -> Div {
         let fg = self.fg();
+        let settings = div()
+            .id("panel-heading-settings")
+            .size(px(34.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(self.cell_bg())
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_panel(cx);
+                this.go(Page::Settings, cx);
+            }))
+            .child(glyph(IconName::Settings, 16.0, fg));
         let close = div()
             .id("panel-close")
             .size(px(34.0))
@@ -2131,7 +2370,14 @@ impl Metro {
                             .child(title),
                     ),
             )
-            .child(close)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .when(with_settings, |d| d.child(settings))
+                    .child(close),
+            )
     }
 
     /// System panel: quick toggles, brightness, accent + theme shortcuts.
@@ -2139,7 +2385,8 @@ impl Metro {
         let fg = self.fg();
         let caption = |text: &'static str| {
             div()
-                .mt(px(4.0))
+                .mt(px(2.0))
+                .mb(px(-4.0))
                 .text_size(px(11.0))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(fg.opacity(0.55))
@@ -2152,11 +2399,7 @@ impl Metro {
             .child(self.quick_action(
                 "qa-wifi",
                 "Wi-Fi",
-                if self.wifi {
-                    IconName::Wifi
-                } else {
-                    IconName::WifiOff
-                },
+                IconName::Wifi,
                 self.wifi,
                 Self::toggle_wifi,
                 0,
@@ -2165,11 +2408,7 @@ impl Metro {
             .child(self.quick_action(
                 "qa-bt",
                 "Bluetooth",
-                if self.bluetooth {
-                    IconName::Bluetooth
-                } else {
-                    IconName::BluetoothOff
-                },
+                IconName::Bluetooth,
                 self.bluetooth,
                 Self::toggle_bluetooth,
                 1,
@@ -2191,11 +2430,7 @@ impl Metro {
             .child(self.quick_action(
                 "qa-quiet",
                 "Quiet hours",
-                if self.quiet {
-                    IconName::BellOff
-                } else {
-                    IconName::Bell
-                },
+                IconName::Bell,
                 self.quiet,
                 |this| this.quiet = !this.quiet,
                 3,
@@ -2213,87 +2448,163 @@ impl Metro {
             .child(self.quick_action(
                 "qa-battery",
                 "Battery saver",
-                if self.battery_saver {
-                    IconName::BatteryCharging
-                } else {
-                    IconName::Battery
-                },
+                IconName::Battery,
                 self.battery_saver,
                 |this| this.battery_saver = !this.battery_saver,
                 5,
                 cx,
             ));
 
-        let brightness = self.slider(
-            Slider {
-                id: "brightness-track",
-                kind: Drag::Brightness,
-                min: "0",
-                max: "100",
-                value: format!("{}%", (self.brightness * 100.0).round() as u32),
-                ratio: self.brightness,
-            },
-            cx,
-        );
-
-        let swatches: Vec<Stateful<Div>> = ACCENTS
-            .iter()
-            .take(10)
-            .enumerate()
-            .map(|(i, &c)| {
+        let brightness_ratio = self.brightness.clamp(0.0, 1.0);
+        let brightness = div()
+            .w_full()
+            .h(px(32.0))
+            .flex()
+            .items_center()
+            .gap(px(14.0))
+            .child(
                 div()
-                    .id(("panel-accent", i))
-                    .size(px(26.0))
-                    .rounded(px(2.0))
-                    .bg(rgb(c))
+                    .id("brightness-track")
+                    .relative()
+                    .flex_1()
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                            this.drag = Some(Drag::Brightness);
+                            this.apply_drag(Drag::Brightness, f32::from(e.position.x));
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(4.0))
+                            .bg(self.cell_bg())
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.0))
+                                    .top(px(0.0))
+                                    .h(px(4.0))
+                                    .bg(rgb(self.accent))
+                                    .w(relative(brightness_ratio))
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .right(px(-8.0))
+                                            .top(px(-4.0))
+                                            .size(px(12.0))
+                                            .rounded_full()
+                                            .bg(rgb(self.accent)),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("brightness-auto")
+                    .size(px(28.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
                     .cursor_pointer()
                     .active(|s| s.opacity(0.6))
-                    .when(self.accent == c, |d| d.border_2().border_color(fg))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.accent = c;
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.brightness = 1.0;
                         this.save_soon(cx);
                         cx.notify();
                     }))
-            })
-            .collect();
+                    .child(glyph(IconName::Sun, 18.0, fg.opacity(0.75))),
+            );
 
-        let panel_button = |id: &'static str, icon: IconName, text: &'static str| {
-            div()
-                .id(id)
-                .flex_1()
-                .h(px(40.0))
-                .flex()
-                .items_center()
-                .justify_center()
-                .gap(px(8.0))
-                .bg(self.cell_bg())
-                .rounded(px(2.0))
-                .cursor_pointer()
-                .active(|s| s.opacity(0.65))
-                .child(glyph(icon, 17.0, fg))
-                .child(div().text_size(px(12.0)).text_color(fg).child(text))
-        };
+        let profile = div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .size(px(40.0))
+                    .rounded_full()
+                    .bg(rgb(self.accent))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(glyph(IconName::Users, 20.0, on_color(self.accent))),
+            )
+            .child(
+                div()
+                    .text_size(px(16.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .child("Ibrahim Zaman"),
+            );
 
-        let theme_btn = panel_button(
-            "panel-theme",
-            if self.dark {
-                IconName::Sun
-            } else {
-                IconName::Moon
-            },
-            if self.dark { "Light mode" } else { "Dark mode" },
-        )
-        .on_click(cx.listener(|this, _, _, cx| {
-            this.dark = !this.dark;
-            this.save_soon(cx);
-            cx.notify();
-        }));
+        let logout = div()
+            .id("system-profile-logout")
+            .size(px(34.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(self.cell_bg())
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.close_panel(cx);
+                this.home(cx);
+            }))
+            .child(glyph(IconName::LogOut, 16.0, fg));
 
-        let settings_btn = panel_button("panel-settings", IconName::Settings, "All settings")
+        let settings = div()
+            .id("system-profile-settings")
+            .size(px(34.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(self.cell_bg())
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
             .on_click(cx.listener(|this, _, _, cx| {
                 this.close_panel(cx);
                 this.go(Page::Settings, cx);
-            }));
+            }))
+            .child(glyph(IconName::Settings, 16.0, fg));
+
+        let dismiss = div()
+            .id("system-profile-dismiss")
+            .size(px(34.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(self.cell_bg())
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx)))
+            .child(glyph(IconName::ChevronUp, 20.0, fg));
+
+        let header = div()
+            .w_full()
+            .h(px(44.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(profile)
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(logout)
+                    .child(settings)
+                    .child(dismiss),
+            );
 
         div()
             .id("panel-scroll")
@@ -2304,23 +2615,13 @@ impl Metro {
             .pb(px(PANEL_PAD))
             .flex()
             .flex_col()
-            .gap(px(8.0))
-            .child(self.panel_heading("Action Center", "Control Panel", cx))
+            .gap(px(6.0))
+            .child(header)
             .child(caption("Quick Actions"))
             .child(row1)
             .child(row2)
             .child(caption("Brightness"))
             .child(brightness)
-            .child(caption("Accent"))
-            .child(div().flex().flex_wrap().gap(px(6.0)).children(swatches))
-            .child(div().flex_1())
-            .child(
-                div()
-                    .flex()
-                    .gap(px(8.0))
-                    .child(theme_btn)
-                    .child(settings_btn),
-            )
     }
 
     /// Notification panel: swipe down from the left half of the status bar.
@@ -2383,27 +2684,23 @@ impl Metro {
             .flex()
             .flex_col()
             .gap(px(6.0))
-            .child(self.panel_heading("Notifications", "Notifications", cx))
+            .child(self.panel_heading("Notifications", "Notifications", false, cx))
             .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .child(
-                        div()
-                            .text_size(px(11.0))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(fg.opacity(0.55))
-                            .child(if self.notes_cleared {
-                                "No new notifications"
-                            } else {
-                                "New in the last 24 hours"
-                            }),
-                    )
-                    .child(clear),
+                div().flex().items_center().justify_start().child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg.opacity(0.55))
+                        .child(if self.notes_cleared {
+                            "No new notifications"
+                        } else {
+                            "New in the last 24 hours"
+                        }),
+                ),
             )
             .child(body)
             .child(div().flex_1())
+            .child(div().w_full().flex().justify_end().child(clear))
     }
 
     /// One notification; rows slide in from the left one after another.
@@ -2486,7 +2783,7 @@ impl Metro {
     /// on release it eases the rest of the way open (or back up).
     fn panel_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let viewport_h = f32::from(window.viewport_size().height);
-        let panel_h = Self::panel_height_for(viewport_h);
+        let panel_h = Self::panel_height_for(viewport_h, self.panel.unwrap_or(PanelKind::System));
         let open = self.panel.is_some() && !self.panel_closing;
 
         let (slide_target, slide_ms) = if self.pulling {
@@ -2548,7 +2845,11 @@ impl Metro {
             .top(px(top))
             .w_full()
             .h(px(panel_h))
-            .bg(self.panel_bg())
+            .bg(if self.dark {
+                hsla(0.0, 0.0, 0.08, 0.78)
+            } else {
+                hsla(0.0, 0.0, 1.0, 0.82)
+            })
             .border_b_1()
             .border_color(self.fg().opacity(0.12))
             .shadow_lg()
@@ -2575,10 +2876,27 @@ impl Metro {
         let app = &APPS[tile.app];
         let fg = self.fg();
         let width = 196.0;
-        let height = 232.0;
-        let x = menu.x.min(self.measured_w - width - 8.0).max(8.0);
-        let y = menu
-            .y
+        let height = 274.0;
+        let (layout, _) = self.tile_layout();
+        let tile_ix = self.tiles.iter().position(|t| t.id == menu.id)?;
+        let pos = layout[tile_ix];
+        let (cw, ch) = tile.size.cells();
+        let max_x = (self.cols as f32 - cw as f32).max(0.0) * (self.cell + self.gap);
+        let tile_x = TILE_MARGIN + pos.0 * max_x;
+        let tile_y = STATUS_H + 8.0 - f32::from(self.start_scroll.offset().y)
+            + pos.1 * (self.cell + self.gap);
+        let tile_w = cw as f32 * self.cell + (cw as f32 - 1.0) * self.gap;
+        let tile_h = ch as f32 * self.cell + (ch as f32 - 1.0) * self.gap;
+        let preferred_x = tile_x + tile_w + 8.0;
+        let preferred_y = tile_y + tile_h * 0.5 - height * 0.5;
+        let x = if preferred_x + width <= self.measured_w {
+            preferred_x
+        } else {
+            (tile_x - width - 8.0).max(8.0)
+        }
+        .min(self.measured_w - width - 8.0)
+        .max(8.0);
+        let y = preferred_y
             .min(self.vh - NAV_H - height - 8.0)
             .max(STATUS_H + 8.0);
         let tile_id = tile.id;
@@ -2589,7 +2907,8 @@ impl Metro {
             (TileSize::Wide, "Wide"),
             (TileSize::Large, "Full"),
         ];
-        let mut rows: Vec<AnyElement> = Vec::with_capacity(sizes.len() + 1);
+        let live_enabled = tile.live_enabled;
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(sizes.len() + 2);
         for (slot, (size, name)) in sizes.into_iter().enumerate() {
             let current = tile.size == size;
             rows.push(
@@ -2605,11 +2924,8 @@ impl Metro {
                     .when(current, |d| d.bg(self.cell_bg()))
                     .active(|s| s.opacity(0.6))
                     .on_click(cx.listener(move |this, _, _, cx| {
-                        if let Some(t) = this.tiles.iter_mut().find(|t| t.id == tile_id) {
-                            t.size = size;
-                        }
+                        this.resize_tile(tile_id, size, cx);
                         this.tile_menu = None;
-                        this.save_soon(cx);
                         cx.notify();
                     }))
                     .child(
@@ -2624,6 +2940,44 @@ impl Metro {
                     .into_any_element(),
             );
         }
+
+        rows.push(
+            div()
+                .id("menu-live-tile")
+                .h(px(34.0))
+                .px(px(8.0))
+                .flex()
+                .items_center()
+                .justify_between()
+                .rounded(px(2.0))
+                .cursor_pointer()
+                .when(live_enabled, |d| d.bg(self.cell_bg()))
+                .active(|s| s.opacity(0.6))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    if let Some(tile) = this.tiles.iter_mut().find(|tile| tile.id == tile_id) {
+                        tile.live_enabled = !tile.live_enabled;
+                        tile.prev = tile.idx;
+                        tile.tick = 0;
+                    }
+                    this.tile_menu = None;
+                    this.save_soon(cx);
+                    cx.notify();
+                }))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(fg.opacity(0.85))
+                        .child(if live_enabled {
+                            "Disable Live Tile"
+                        } else {
+                            "Enable Live Tile"
+                        }),
+                )
+                .when(live_enabled, |d| {
+                    d.child(div().text_size(px(13.0)).text_color(fg).child("✓"))
+                })
+                .into_any_element(),
+        );
 
         let card = div()
             .absolute()
@@ -3123,13 +3477,6 @@ impl Metro {
             .flex_col()
             .child(
                 div()
-                    .text_size(px(11.0))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(white().opacity(0.6))
-                    .child("MULTITASKING"),
-            )
-            .child(
-                div()
                     .text_size(px(28.0))
                     .line_height(px(32.0))
                     .font_weight(FontWeight::LIGHT)
@@ -3172,6 +3519,36 @@ impl Metro {
                     .h(px(content_h))
                     .child(header)
                     .children(cards)
+                    .child(
+                        div()
+                            .absolute()
+                            .left(px(0.0))
+                            .bottom(px(12.0))
+                            .w_full()
+                            .flex()
+                            .justify_center()
+                            .child(
+                                div()
+                                    .id("running-clear-all")
+                                    .h(px(34.0))
+                                    .px(px(18.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(hsla(0.0, 0.0, 1.0, 0.14))
+                                    .cursor_pointer()
+                                    .active(|s| s.opacity(0.6))
+                                    .text_size(px(12.0))
+                                    .text_color(white())
+                                    .child("Clear all")
+                                    .on_click(cx.listener(|this, _, _, cx| {
+                                        this.running.clear();
+                                        this.dismissing = None;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
                     .when(n == 0, |d| {
                         d.child(
                             div()
@@ -3444,9 +3821,9 @@ impl Metro {
             .text_size(px(12.0))
             .text_color(fg)
             .bg(if self.dark {
-                hsla(0.0, 0.0, 0.0, 0.30)
+                hsla(0.0, 0.0, 0.05, 0.16)
             } else {
-                hsla(0.0, 0.0, 1.0, 0.40)
+                hsla(0.0, 0.0, 1.0, 0.22)
             })
             .cursor_pointer()
             // Press starts a potential pull. Dragging down makes the panel follow the
@@ -3477,10 +3854,21 @@ impl Metro {
             )
             .child(
                 div()
-                    .w(px(44.0))
-                    .h(px(3.0))
-                    .rounded_full()
-                    .bg(fg.opacity(0.55)),
+                    .w(px(54.0))
+                    .h(px(11.0))
+                    .flex()
+                    .items_end()
+                    .justify_center()
+                    .child(
+                        div()
+                            .w(px(36.0))
+                            .h(px(6.0))
+                            .border_t_1()
+                            .border_l_1()
+                            .border_r_1()
+                            .border_color(fg.opacity(0.50))
+                            .rounded_t(px(8.0)),
+                    ),
             )
             .child(
                 div()
@@ -3503,6 +3891,14 @@ impl Metro {
 
     fn nav_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let fg = self.fg();
+        let back_disabled = self.page == Page::Start
+            && !self.editing
+            && self.tile_menu.is_none()
+            && !self.add_sheet
+            && self.panel.is_none()
+            && !self.switcher
+            && self.edit.is_none()
+            && self.launch.is_none();
         let btn = |id: &'static str| {
             div()
                 .id(id)
@@ -3535,8 +3931,15 @@ impl Metro {
             .text_color(fg)
             .child(
                 btn("nav-back")
-                    .child(glyph(IconName::ArrowLeft, 26.0, fg))
-                    .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
+                    .child(glyph(
+                        IconName::ArrowLeft,
+                        26.0,
+                        if back_disabled { fg.opacity(0.25) } else { fg },
+                    ))
+                    .when(!back_disabled, |d| {
+                        d.cursor_pointer()
+                            .on_click(cx.listener(|this, _, _, cx| this.back(cx)))
+                    }),
             )
             .child(
                 // Tap = Start, hold = running apps.
@@ -3720,7 +4123,7 @@ impl Metro {
             return self.face(&Face::Icon, t, ink).into_any_element();
         }
 
-        if t.faces.len() > 1 && t.tick > 0 {
+        if t.live_enabled && t.faces.len() > 1 && t.tick > 0 {
             let anim = || Animation::new(Duration::from_millis(650)).with_easing(ease_out_quint());
             let out = self.face(&t.faces[t.prev], t, ink).with_animation(
                 ("face-out", t.tick),
@@ -3747,7 +4150,7 @@ impl Metro {
     fn tile_view(
         &self,
         ix: usize,
-        pos: (usize, usize),
+        pos: (f32, f32),
         entering: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -3758,8 +4161,9 @@ impl Metro {
         let (cell, g) = (self.cell, self.gap);
 
         // target geometry from the packer …
-        let tx = pos.0 as f32 * (cell + g);
-        let ty = pos.1 as f32 * (cell + g);
+        let max_x = (self.cols as f32 - cw as f32).max(0.0) * (cell + g);
+        let tx = pos.0 * max_x;
+        let ty = pos.1 * (cell + g);
         let tw = cw as f32 * cell + (cw as f32 - 1.0) * g;
         let th = ch as f32 * cell + (ch as f32 - 1.0) * g;
         // … and the animated values actually painted this frame
@@ -3771,7 +4175,11 @@ impl Metro {
         let selected = self.edit == Some(id);
         let editing = self.editing || selected;
         let color_hex = APPS[t.app].color.unwrap_or(self.accent);
-        let color = rgb(color_hex).opacity(self.tile_alpha);
+        let color = rgb(color_hex).opacity(if self.liquid_glass {
+            self.tile_alpha
+        } else {
+            1.0
+        });
         let ink = on_color(color_hex);
         let inverse = inverse_ink(color_hex);
         let content = self.tile_content(t, h);
@@ -3789,14 +4197,13 @@ impl Metro {
             if l.tile == Some(id) {
                 (Turn::Idle, 0.0)
             } else {
-                let dist =
-                    (pos.0 as f32 - l.from.0 as f32).abs() + (pos.1 as f32 - l.from.1 as f32).abs();
+                let dist = (pos.0 - l.from.0 as f32).abs() + (pos.1 - l.from.1 as f32).abs();
                 (Turn::Leave(l.n), (dist * 22.0).min(160.0))
             }
         } else if entering && self.nav_at.elapsed().as_millis() < ENTER_WINDOW_MS {
             (
                 Turn::Enter(self.nav),
-                (pos.1 as f32 * 45.0 + pos.0 as f32 * 12.0).min(320.0),
+                (pos.1 * 45.0 + pos.0 * 12.0).min(320.0),
             )
         } else {
             (Turn::Idle, 0.0)
@@ -3828,6 +4235,9 @@ impl Metro {
             .size_full()
             .overflow_hidden()
             .bg(color)
+            .when(self.tile_borders, |d| {
+                d.border_1().border_color(ink.opacity(0.55))
+            })
             .when(selected, |d| d.border_2().border_color(ink))
             .child(content)
             .when(editing, |d| {
@@ -3917,9 +4327,15 @@ impl Metro {
                 )
             })
             .drag_over::<DraggedTile>(|s, _, _, _| s.opacity(0.55))
-            .on_drop(cx.listener(move |this, d: &DraggedTile, _, cx| {
+            .on_drop(cx.listener(move |this, d: &DraggedTile, window, cx| {
                 this.drop_handled = true;
-                this.move_tile(d.id, id, cx);
+                if this.auto_adjust_tiles {
+                    this.move_tile(d.id, id, cx);
+                } else {
+                    let position = window.mouse_position();
+                    this.pointer = (f32::from(position.x), f32::from(position.y));
+                    this.place_tile_at_pointer(d.id, cx);
+                }
             }))
             .child(turnstile(plate, w, h, id, turn, delay));
 
@@ -3947,7 +4363,7 @@ impl Metro {
 
     fn start_page(
         &self,
-        layout: &[(usize, usize)],
+        layout: &[(f32, f32)],
         rows: usize,
         entering: bool,
         window: &mut Window,
@@ -3997,9 +4413,15 @@ impl Metro {
             }))
             // Dropping on empty space sends the tile to the end of the list.
             // (If a tile already handled this drop, `drop_handled` skips it.)
-            .on_drop(cx.listener(|this, d: &DraggedTile, _, cx| {
+            .on_drop(cx.listener(|this, d: &DraggedTile, window, cx| {
                 if !this.drop_handled {
-                    this.move_to_end(d.id, cx);
+                    if this.auto_adjust_tiles {
+                        this.move_to_end(d.id, cx);
+                    } else {
+                        let position = window.mouse_position();
+                        this.pointer = (f32::from(position.x), f32::from(position.y));
+                        this.place_tile_at_pointer(d.id, cx);
+                    }
                 }
                 this.drop_handled = false;
             }))
@@ -4093,10 +4515,10 @@ impl Metro {
     }
 
     fn apps_page(&self, key: Option<usize>, cx: &mut Context<Self>) -> impl IntoElement {
+        let _ = key;
         let fg = self.fg();
         let query = self.search.trim().to_lowercase();
 
-        // Filter by name / category, then group by category (declared order).
         let mut order: Vec<usize> = (0..APPS.len())
             .filter(|&i| {
                 query.is_empty()
@@ -4104,24 +4526,54 @@ impl Metro {
                     || APPS[i].category.name().to_lowercase().contains(&query)
             })
             .collect();
-        order.sort_by_key(|&i| (APPS[i].category.rank(), APPS[i].name));
+        if self.app_sort == AppSort::Alphabetical {
+            order.sort_by_key(|&i| APPS[i].name.to_lowercase());
+        } else {
+            order.sort_by_key(|&i| (APPS[i].category.rank(), APPS[i].name.to_lowercase()));
+        }
 
         let mut list: Vec<AnyElement> = Vec::new();
-        let mut current: Option<Category> = None;
+        let mut current_category: Option<Category> = None;
+        let mut current_letter: Option<char> = None;
         for &i in &order {
-            let category = APPS[i].category;
-            if current != Some(category) {
-                current = Some(category);
-                list.push(
-                    div()
-                        .mt(px(16.0))
-                        .mb(px(2.0))
-                        .text_size(px(12.0))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(fg.opacity(0.55))
-                        .child(category.name())
-                        .into_any_element(),
-                );
+            match self.app_sort {
+                AppSort::Category => {
+                    let category = APPS[i].category;
+                    if current_category != Some(category) {
+                        current_category = Some(category);
+                        list.push(
+                            div()
+                                .mt(px(16.0))
+                                .mb(px(2.0))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg.opacity(0.55))
+                                .child(category.name())
+                                .into_any_element(),
+                        );
+                    }
+                }
+                AppSort::Alphabetical => {
+                    let letter = APPS[i]
+                        .name
+                        .chars()
+                        .next()
+                        .unwrap_or('?')
+                        .to_ascii_uppercase();
+                    if current_letter != Some(letter) {
+                        current_letter = Some(letter);
+                        list.push(
+                            div()
+                                .mt(px(16.0))
+                                .mb(px(2.0))
+                                .text_size(px(12.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg.opacity(0.55))
+                                .child(letter.to_string())
+                                .into_any_element(),
+                        );
+                    }
+                }
             }
             list.push(self.app_row(i, cx).into_any_element());
         }
@@ -4172,7 +4624,19 @@ impl Metro {
                 }
                 cx.notify();
             }))
-            .child(glyph(IconName::Search, 17.0, fg.opacity(0.6)))
+            .child(
+                div()
+                    .id("apps-search-icon")
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _, window, cx| {
+                            this.search_focus.focus(window, cx);
+                            cx.notify();
+                        }),
+                    )
+                    .child(glyph(IconName::Search, 17.0, fg.opacity(0.6))),
+            )
             .child(
                 div()
                     .flex_1()
@@ -4208,6 +4672,36 @@ impl Metro {
                 )
             });
 
+        let app_header = div()
+            .relative()
+            .w_full()
+            .h(px(72.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_size(px(54.0))
+                    .line_height(px(60.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .child("Apps"),
+            )
+            .child(
+                div()
+                    .id("apps-sort-menu")
+                    .size(px(36.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .active(|s| s.opacity(0.6))
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.app_sort_menu = !this.app_sort_menu;
+                        cx.notify();
+                    }))
+                    .child(glyph(IconName::Ellipsis, 22.0, fg)),
+            );
+
         div()
             .id("apps-scroll")
             .size_full()
@@ -4221,10 +4715,89 @@ impl Metro {
                     .flex()
                     .flex_col()
                     .pb(px(28.0))
-                    .child(pivot_header("All Apps".into(), "Apps".into(), key))
+                    .child(app_header)
                     .child(search)
                     .children(list),
             )
+    }
+
+    fn app_sort_menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if self.page != Page::Apps || !self.app_sort_menu {
+            return None;
+        }
+        let fg = self.fg();
+        let category = div()
+            .id("sort-category-overlay")
+            .h(px(36.0))
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .rounded(px(2.0))
+            .cursor_pointer()
+            .when(self.app_sort == AppSort::Category, |d| d.bg(self.cell_bg()))
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.app_sort = AppSort::Category;
+                this.app_sort_menu = false;
+                this.save_soon(cx);
+                cx.notify();
+            }))
+            .child(div().text_size(px(12.0)).child("Category"));
+
+        let alphabetical = div()
+            .id("sort-alphabetical-overlay")
+            .h(px(36.0))
+            .px(px(10.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .rounded(px(2.0))
+            .cursor_pointer()
+            .when(self.app_sort == AppSort::Alphabetical, |d| {
+                d.bg(self.cell_bg())
+            })
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.app_sort = AppSort::Alphabetical;
+                this.app_sort_menu = false;
+                this.save_soon(cx);
+                cx.notify();
+            }))
+            .child(div().text_size(px(12.0)).child("Alphabetically"));
+
+        let width = 176.0;
+        let right = (TILE_MARGIN).max(8.0);
+        let top = STATUS_H + 8.0 + 72.0 - 8.0;
+        Some(
+            div()
+                .id("apps-sort-overlay")
+                .absolute()
+                .right(px(right))
+                .top(px(top))
+                .w(px(width))
+                .p(px(6.0))
+                .rounded(px(4.0))
+                .bg(self.panel_bg())
+                .border_1()
+                .border_color(fg.opacity(0.16))
+                .shadow_lg()
+                .occlude()
+                .flex()
+                .flex_col()
+                .child(
+                    div()
+                        .h(px(28.0))
+                        .px(px(10.0))
+                        .flex()
+                        .items_center()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg.opacity(0.55))
+                        .child("Sort by"),
+                )
+                .child(category)
+                .child(alphabetical)
+                .into_any_element(),
+        )
     }
 
     fn settings_page(&self, key: Option<usize>, cx: &mut Context<Self>) -> impl IntoElement {
@@ -4379,6 +4952,123 @@ impl Metro {
             cx,
         );
 
+        let liquid_glass = self.liquid_glass;
+        let liquid_glass_toggle = div()
+            .id("setting-liquid-glass")
+            .w_full()
+            .h(px(44.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.liquid_glass = !this.liquid_glass;
+                this.save_soon(cx);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(fg)
+                    .child("Liquid Glass"),
+            )
+            .child(
+                div()
+                    .w(px(38.0))
+                    .h(px(22.0))
+                    .rounded_full()
+                    .bg(if liquid_glass {
+                        rgb(self.accent).into()
+                    } else {
+                        self.cell_bg()
+                    })
+                    .flex()
+                    .items_center()
+                    .when(liquid_glass, |d| d.justify_end())
+                    .when(!liquid_glass, |d| d.justify_start())
+                    .child(div().mx(px(3.0)).size(px(16.0)).rounded_full().bg(fg)),
+            );
+
+        let auto_adjust = self.auto_adjust_tiles;
+        let auto_adjust_toggle = div()
+            .id("setting-auto-adjust")
+            .w_full()
+            .h(px(44.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.auto_adjust_tiles = !this.auto_adjust_tiles;
+                if !this.auto_adjust_tiles {
+                    this.seed_manual_positions();
+                }
+                this.save_soon(cx);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(fg)
+                    .child("Auto-Adjust Tiles"),
+            )
+            .child(
+                div()
+                    .w(px(38.0))
+                    .h(px(22.0))
+                    .rounded_full()
+                    .bg(if auto_adjust {
+                        rgb(self.accent).into()
+                    } else {
+                        self.cell_bg()
+                    })
+                    .flex()
+                    .items_center()
+                    .when(auto_adjust, |d| d.justify_end())
+                    .when(!auto_adjust, |d| d.justify_start())
+                    .child(div().mx(px(3.0)).size(px(16.0)).rounded_full().bg(fg)),
+            );
+
+        let tile_borders = self.tile_borders;
+        let tile_borders_toggle = div()
+            .id("setting-tile-borders")
+            .w_full()
+            .h(px(44.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.tile_borders = !this.tile_borders;
+                this.save_soon(cx);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(fg)
+                    .child("Tile Borders"),
+            )
+            .child(
+                div()
+                    .w(px(38.0))
+                    .h(px(22.0))
+                    .rounded_full()
+                    .bg(if tile_borders {
+                        rgb(self.accent).into()
+                    } else {
+                        self.cell_bg()
+                    })
+                    .flex()
+                    .items_center()
+                    .when(tile_borders, |d| d.justify_end())
+                    .when(!tile_borders, |d| d.justify_start())
+                    .child(div().mx(px(3.0)).size(px(16.0)).rounded_full().bg(fg)),
+            );
+
         let reset = div()
             .id("settings-reset")
             .mt(px(26.0))
@@ -4454,10 +5144,16 @@ impl Metro {
                             .gap(px(6.0))
                             .children(swatches),
                     )
+                    .child(caption("Appearance"))
+                    .child(liquid_glass_toggle)
+                    .when(self.liquid_glass, |d| {
+                        d.child(caption("Tile Transparency")).child(alpha)
+                    })
+                    .child(caption("Tiles"))
+                    .child(auto_adjust_toggle)
+                    .child(tile_borders_toggle)
                     .child(caption("Tile Gap"))
                     .child(gap)
-                    .child(caption("Tile Transparency"))
-                    .child(alpha)
                     .child(reset),
             )
     }
@@ -4541,7 +5237,7 @@ impl Metro {
         let key = entering.then_some(self.nav);
         match page {
             Page::Start => {
-                let (layout, rows) = self.pack();
+                let (layout, rows) = self.tile_layout();
                 self.start_page(&layout, rows, entering, window, cx)
                     .into_any_element()
             }
@@ -4661,6 +5357,7 @@ impl Render for Metro {
         let edit_bar = self.edit_bar(cx);
         let add_sheet = self.add_sheet_layer(cx);
         let tile_menu = self.tile_menu_layer(cx);
+        let app_sort_menu = self.app_sort_menu_layer(cx);
 
         // While a pull or a slider drag is in progress, a transparent layer sits above the
         // (pointer-occluding) panel so the gesture keeps receiving move / up events.
@@ -4762,6 +5459,7 @@ impl Render for Metro {
             .when_some(edit_bar, |d, bar| d.child(bar))
             .when_some(add_sheet, |d, sheet| d.child(sheet))
             .when_some(tile_menu, |d, menu| d.child(menu))
+            .when_some(app_sort_menu, |d, menu| d.child(menu))
             .when_some(catcher, |d, c| d.child(c))
             .child(status_bar)
     }
@@ -4821,8 +5519,8 @@ mod tests {
     // Deliberately not `use super::*`: the crate-root glob import of `gpui_kit`
     // brings a `test` macro that would shadow Rust's built-in `#[test]`.
     use super::{
-        CONFIG_VERSION, Config, GAP_MAX, TILE_ALPHA_MIN, TileSize, WALLPAPER_NAMES, app_index,
-        default_tiles, is_image_file, load_config, save_config, wallpaper_label,
+        AppSort, CONFIG_VERSION, Config, GAP_MAX, TILE_ALPHA_MIN, TileSize, WALLPAPER_NAMES,
+        app_index, default_tiles, is_image_file, load_config, save_config, wallpaper_label,
     };
 
     #[test]
@@ -4854,14 +5552,23 @@ mod tests {
 
     #[test]
     fn config_round_trips_through_json() {
-        let mut config = Config::default();
-        config.dark = false;
-        config.accent = 0xE51400;
-        config.wallpaper = 3;
-        config.gap = 14.5;
-        config.tile_alpha = 0.75;
-        config.brightness = 0.6;
+        let mut config = Config {
+            dark: false,
+            accent: 0xE51400,
+            wallpaper: 3,
+            gap: 14.5,
+            tile_alpha: 0.75,
+            brightness: 0.6,
+            liquid_glass: true,
+            auto_adjust_tiles: false,
+            tile_borders: true,
+            app_sort: AppSort::Alphabetical,
+            ..Config::default()
+        };
         config.tiles[0].size = TileSize::Large;
+        config.tiles[0].live_enabled = false;
+        config.tiles[0].manual_x = Some(0.25);
+        config.tiles[0].manual_y = Some(3.0);
 
         let json = serde_json::to_string(&config).expect("serialise");
         let parsed: Config = serde_json::from_str(&json).expect("parse");
@@ -4873,9 +5580,16 @@ mod tests {
         assert_eq!(parsed.gap, 14.5);
         assert_eq!(parsed.tile_alpha, 0.75);
         assert_eq!(parsed.brightness, 0.6);
+        assert!(parsed.liquid_glass);
+        assert!(!parsed.auto_adjust_tiles);
+        assert!(parsed.tile_borders);
+        assert_eq!(parsed.app_sort, AppSort::Alphabetical);
         assert_eq!(parsed.tiles.len(), config.tiles.len());
         assert_eq!(parsed.tiles[0].app, config.tiles[0].app);
         assert!(matches!(parsed.tiles[0].size, TileSize::Large));
+        assert!(!parsed.tiles[0].live_enabled);
+        assert_eq!(parsed.tiles[0].manual_x, Some(0.25));
+        assert_eq!(parsed.tiles[0].manual_y, Some(3.0));
     }
 
     #[test]
@@ -4900,9 +5614,14 @@ mod tests {
         assert_eq!(config.gap, GAP_MAX);
         assert_eq!(config.tile_alpha, TILE_ALPHA_MIN);
         assert_eq!(config.brightness, 1.0);
+        assert!(!config.liquid_glass);
+        assert!(config.auto_adjust_tiles);
         // The bogus tile is dropped, the real one is kept.
         assert_eq!(config.tiles.len(), 1);
         assert_eq!(config.tiles[0].app, "Clock");
+        assert!(config.tiles[0].live_enabled);
+        assert_eq!(config.tiles[0].manual_x, None);
+        assert_eq!(config.tiles[0].manual_y, None);
     }
 
     #[test]
@@ -4917,10 +5636,12 @@ mod tests {
             std::env::set_var("HORN_CONFIG", &path);
         }
 
-        let mut config = Config::default();
-        config.accent = 0x008A00;
-        config.gap = 4.0;
-        config.wallpaper = 2;
+        let mut config = Config {
+            accent: 0x008A00,
+            gap: 4.0,
+            wallpaper: 2,
+            ..Config::default()
+        };
         config.tiles.retain(|tile| tile.app != "Games");
 
         save_config(&config);
