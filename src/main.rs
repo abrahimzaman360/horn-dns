@@ -12,22 +12,36 @@
 //!
 //! Interactions
 //!   • Live tiles flip on their own (staggered), clock ticks every second
-//!   • Press a tile -> it squishes, release opens the app
+//!   • Press a tile -> it squishes, release opens the app with a book-page turn
+//!     (the outgoing page is peeled away, Windows Phone style)
 //!   • Right-click a tile -> edit mode: ✕ unpins, ↔ cycles small → medium → wide → large
 //!   • Small tiles are icon-only: captions, badges and live info are hidden
+//!   • Long labels are clamped with an ellipsis, so tile text never spills out
 //!   • In edit mode, DRAG a tile onto another tile to take its place; everything re-packs.
 //!     Dropping on empty space sends it to the end.
-//!   • Arrow at the end of the tiles -> All Apps (right-click an app to pin/unpin)
-//!   • Settings tile -> light/dark theme, wallpaper + 20 classic accent colours
-//!   • Swipe down (or click) the status bar -> control panel: quick toggles,
-//!     brightness, accent swatches, theme + All settings
+//!   • Arrow at the end of the tiles -> All Apps: category headings, a search field at
+//!     the top, rectangular icon borders (right-click an app to pin/unpin)
+//!   • Settings tile -> theme + wallpaper + accent, tile gap and tile transparency,
+//!     plus "Reset to Defaults"
+//!   • The status bar never hides: it is the always-on top layer. Swipe down on its
+//!     left half for notifications, on its right half for the system panel (quick
+//!     toggles, brightness, accent). Clicking outside slides it back up.
 //!   • Bottom bar: ← back (also leaves edit mode / closes the panel), ⊞ start, ⌕ apps
+//!
+//! Persistence
+//!   • Tile order/sizes and every theme setting are saved as JSON and restored on
+//!     the next launch. Writes are debounced, then flushed on shutdown.
+//!   • Default path: `$XDG_CONFIG_HOME|~/.config/horn/config.json`, `%APPDATA%\horn\
+//!     config.json` on Windows, `~/Library/Application Support/horn/config.json` on
+//!     macOS. Set `HORN_CONFIG` to override it with an explicit file path.
 use gpui_kit::assets::{Assets as ComponentAssets, IconName, icon_assets};
 use gpui_kit::base::{Easing, Transition, transition};
 use gpui_kit::component::Icon;
 use gpui_kit::prelude::*;
 use gpui_kit::*;
+use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+use std::path::PathBuf;
 use std::time::Duration;
 
 // ───────────────────────────── assets ─────────────────────────────
@@ -101,23 +115,32 @@ const ACCENTS: [u32; 20] = [
 
 // Layout constants (logical px)
 const MARGIN: f32 = 20.0; // left/right page margin
-const GAP: f32 = 10.0; // gap between tiles
+const DEFAULT_GAP: f32 = 10.0; // default gap between tiles (user adjustable)
+const GAP_MIN: f32 = 0.0;
+const GAP_MAX: f32 = 28.0;
 const TARGET_CELL: f32 = 78.0; // preferred small-cell size; actual size stretches to fill the width
-const PANEL_PAD: f32 = 20.0; // control-panel inner margin
+const PANEL_PAD: f32 = 20.0; // panel inner margin
+const STATUS_H: f32 = 26.0; // status bar height (always the top layer)
+const TILE_ALPHA_MIN: f32 = 0.30; // most transparent a tile may get
+const WINDOW_WIDTH: f32 = 476.0; // main (host) window width; height fills the screen
 
 // Wallpaper presets: (top-left, bottom-right). Each theme gets its own set so the
 // foreground text stays readable without a heavy scrim.
-const WALLPAPERS_DARK: [(u32, u32); 3] = [
+const WALLPAPERS_DARK: [(u32, u32); 5] = [
     (0x0B1B2B, 0x123B4C), // Dusk
     (0x0A0A0A, 0x262626), // Graphite
     (0x170B29, 0x2C1A46), // Plum
+    (0x061F2B, 0x0B4F6C), // Ocean
+    (0x2B1206, 0x6C2A0B), // Ember
 ];
-const WALLPAPERS_LIGHT: [(u32, u32); 3] = [
+const WALLPAPERS_LIGHT: [(u32, u32); 5] = [
     (0xE7EEF5, 0xBBD6E6), // Dusk
     (0xF2F2F2, 0xD6D6D6), // Graphite
     (0xF2EAF7, 0xD7C6E8), // Plum
+    (0xE4F5FA, 0xB9DEEC), // Ocean
+    (0xFCEFE4, 0xF2CDB4), // Ember
 ];
-const WALLPAPER_NAMES: [&str; 3] = ["dusk", "graphite", "plum"];
+const WALLPAPER_NAMES: [&str; 5] = ["Dusk", "Graphite", "Plum", "Ocean", "Ember"];
 
 /// WCAG relative luminance for an 0xRRGGBB colour.
 fn relative_luminance(hex: u32) -> f32 {
@@ -153,38 +176,423 @@ fn inverse_ink(hex: u32) -> Hsla {
     }
 }
 
+/// Pivot-style groups used by the All Apps list (declared order = display order).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Category {
+    Communication,
+    Media,
+    Productivity,
+    Games,
+    Tools,
+    System,
+}
+
+impl Category {
+    fn name(self) -> &'static str {
+        match self {
+            Category::Communication => "Communication",
+            Category::Media => "Media",
+            Category::Productivity => "Productivity",
+            Category::Games => "Games",
+            Category::Tools => "Tools",
+            Category::System => "System",
+        }
+    }
+
+    fn rank(self) -> usize {
+        match self {
+            Category::Communication => 0,
+            Category::Media => 1,
+            Category::Productivity => 2,
+            Category::Games => 3,
+            Category::Tools => 4,
+            Category::System => 5,
+        }
+    }
+}
+
 struct AppDef {
     name: &'static str,
     icon: IconName,
+    category: Category,
     /// None = follows the system accent colour
     color: Option<u32>,
 }
 
-const fn def(name: &'static str, icon: IconName, color: Option<u32>) -> AppDef {
-    AppDef { name, icon, color }
+const fn def(name: &'static str, icon: IconName, category: Category, color: Option<u32>) -> AppDef {
+    AppDef {
+        name,
+        icon,
+        category,
+        color,
+    }
 }
 
 static APPS: &[AppDef] = &[
-    def("Phone", IconName::Phone, None),                     // 0
-    def("People", IconName::Users, None),                    // 1
-    def("Messaging", IconName::MessageSquare, None),         // 2
-    def("Mail", IconName::Mail, None),                       // 3
-    def("Calendar", IconName::CalendarDays, Some(0x0050EF)), // 4
-    def("Photos", IconName::Image, Some(0x008A00)),          // 5
-    def("Music", IconName::Music, Some(0xFA6800)),           // 6
-    def("Store", IconName::ShoppingBag, Some(0x60A917)),     // 7
-    def("Weather", IconName::Sun, Some(0x1BA1E2)),           // 8
-    def("Maps", IconName::Map, Some(0xAA00FF)),              // 9
-    def("Internet", IconName::Globe, Some(0x0050EF)),        // 10
-    def("Clock", IconName::Clock, Some(0x00ABA9)),           // 11
-    def("Settings", IconName::Settings, Some(0x647687)),     // 12
-    def("Games", IconName::Gamepad2, Some(0x60A917)),        // 13
-    def("Camera", IconName::Camera, Some(0x76608A)),         // 14
-    def("Notes", IconName::StickyNote, Some(0xF0A30A)),      // 15
+    def("Phone", IconName::Phone, Category::Communication, None), // 0
+    def("People", IconName::Users, Category::Communication, None), // 1
+    def(
+        "Messaging",
+        IconName::MessageSquare,
+        Category::Communication,
+        None,
+    ), // 2
+    def("Mail", IconName::Mail, Category::Communication, None),   // 3
+    def(
+        "Calendar",
+        IconName::CalendarDays,
+        Category::Productivity,
+        Some(0x0050EF),
+    ), // 4
+    def("Photos", IconName::Image, Category::Media, Some(0x008A00)), // 5
+    def("Music", IconName::Music, Category::Media, Some(0xFA6800)), // 6
+    def(
+        "Store",
+        IconName::ShoppingBag,
+        Category::Tools,
+        Some(0x60A917),
+    ), // 7
+    def("Weather", IconName::Sun, Category::Tools, Some(0x1BA1E2)), // 8
+    def("Maps", IconName::Map, Category::Tools, Some(0xAA00FF)),  // 9
+    def("Internet", IconName::Globe, Category::Tools, Some(0x0050EF)), // 10
+    def("Clock", IconName::Clock, Category::Tools, Some(0x00ABA9)), // 11
+    def(
+        "Settings",
+        IconName::Settings,
+        Category::System,
+        Some(0x647687),
+    ), // 12
+    def("Games", IconName::Gamepad2, Category::Games, Some(0x60A917)), // 13
+    def("Camera", IconName::Camera, Category::Media, Some(0x76608A)), // 14
+    def(
+        "Notes",
+        IconName::StickyNote,
+        Category::Productivity,
+        Some(0xF0A30A),
+    ), // 15
 ];
 const SETTINGS: usize = 12;
 
-#[derive(Clone, Copy, PartialEq)]
+/// A notification shown in the panel pulled down from the left of the status bar.
+struct Note {
+    app: usize,
+    title: &'static str,
+    body: &'static str,
+    when: &'static str,
+}
+
+static NOTES: &[Note] = &[
+    Note {
+        app: 2,
+        title: "Sara · Messaging",
+        body: "Hey! Did you try the new live tiles yet?",
+        when: "now",
+    },
+    Note {
+        app: 3,
+        title: "Fishmind Labs · Mail",
+        body: "Build 0.9 is ready for the private beta.",
+        when: "12m",
+    },
+    Note {
+        app: 4,
+        title: "Design review · Calendar",
+        body: "Starts at 4:30 PM in the Studio.",
+        when: "1h",
+    },
+    Note {
+        app: 7,
+        title: "Store",
+        body: "12 app updates are ready to install.",
+        when: "3h",
+    },
+    Note {
+        app: 8,
+        title: "Weather",
+        body: "Light rain expected around 6 PM.",
+        when: "5h",
+    },
+];
+
+// ───────────────────────────── persisted config ─────────────────────────────
+
+/// Bumped when the on-disk shape needs migrating.
+const CONFIG_VERSION: u32 = 1;
+
+/// Everything that survives a restart. Stored as pretty JSON so it is easy to
+/// hand-edit; unknown or broken values fall back to the defaults below.
+#[derive(Serialize, Deserialize, Clone)]
+struct Config {
+    #[serde(default = "config_version")]
+    version: u32,
+    #[serde(default = "default_dark")]
+    dark: bool,
+    #[serde(default = "default_accent")]
+    accent: u32,
+    #[serde(default)]
+    wallpaper: usize,
+    #[serde(default = "default_gap")]
+    gap: f32,
+    #[serde(default = "default_alpha")]
+    tile_alpha: f32,
+    #[serde(default = "default_brightness")]
+    brightness: f32,
+    /// Start-screen tiles in display order; the first-fit packer places them.
+    #[serde(default = "default_tiles")]
+    tiles: Vec<TileConfig>,
+}
+
+/// App names (not indices) are stored, so the file stays readable and survives
+/// the app list being re-ordered in a future build.
+#[derive(Serialize, Deserialize, Clone)]
+struct TileConfig {
+    app: String,
+    #[serde(default = "default_tile_size")]
+    size: TileSize,
+}
+
+fn config_version() -> u32 {
+    CONFIG_VERSION
+}
+
+fn default_dark() -> bool {
+    true
+}
+
+fn default_accent() -> u32 {
+    0xA4C400
+}
+
+fn default_gap() -> f32 {
+    DEFAULT_GAP
+}
+
+fn default_alpha() -> f32 {
+    1.0
+}
+
+fn default_brightness() -> f32 {
+    1.0
+}
+
+fn default_tile_size() -> TileSize {
+    TileSize::Medium
+}
+
+fn default_tiles() -> Vec<TileConfig> {
+    use TileSize::*;
+    [
+        ("Phone", Medium),
+        ("People", Medium),
+        ("Messaging", Wide),
+        ("Mail", Medium),
+        ("Calendar", Medium),
+        ("Weather", Wide),
+        ("Clock", Medium),
+        ("Music", Medium),
+        ("Photos", Wide),
+        ("Store", Medium),
+        ("Maps", Small),
+        ("Internet", Small),
+        ("Camera", Small),
+        ("Notes", Small),
+        ("Settings", Medium),
+        ("Games", Wide),
+    ]
+    .into_iter()
+    .map(|(app, size)| TileConfig {
+        app: app.to_string(),
+        size,
+    })
+    .collect()
+}
+
+/// The live-tile faces an app starts with (also used when restoring a config).
+fn default_faces(app: usize) -> Vec<Face> {
+    use Face::*;
+    match APPS.get(app).map(|a| a.name) {
+        Some("People") => vec![
+            Mosaic([0xD80073, 0x6A00FF, 0x00ABA9, 0xFA6800]),
+            Text {
+                head: "Sara",
+                body: "is now on Numerals",
+            },
+        ],
+        Some("Messaging") => vec![
+            Icon,
+            Text {
+                head: "Numerals",
+                body: "Hey! Did you try the new live tiles yet?",
+            },
+            Text {
+                head: "Fishmind Labs",
+                body: "Build 0.9 is ready for the private beta.",
+            },
+        ],
+        Some("Mail") => vec![
+            Icon,
+            Text {
+                head: "Fishmind Labs",
+                body: "Weekly build report",
+            },
+        ],
+        Some("Calendar") => vec![
+            Big {
+                value: "18",
+                caption: "Wednesday",
+            },
+            Text {
+                head: "Up next",
+                body: "Design review · 4:30 PM",
+            },
+        ],
+        Some("Photos") => vec![Mosaic([0x008A00, 0x1BA1E2, 0xF0A30A, 0xA20025]), Icon],
+        Some("Music") => vec![
+            Icon,
+            Text {
+                head: "Now playing",
+                body: "Neon Rain — Fishmind",
+            },
+        ],
+        Some("Store") => vec![
+            Icon,
+            Big {
+                value: "12",
+                caption: "updates",
+            },
+        ],
+        Some("Weather") => vec![
+            Big {
+                value: "24°",
+                caption: "Sunny",
+            },
+            Text {
+                head: "Tomorrow",
+                body: "22° · Partly cloudy",
+            },
+            Text {
+                head: "Weekend",
+                body: "Light rain on Saturday",
+            },
+        ],
+        Some("Clock") => vec![Clock],
+        _ => vec![Icon],
+    }
+}
+
+fn default_badge(app: usize) -> Option<u32> {
+    match APPS.get(app).map(|a| a.name) {
+        Some("Phone") => Some(2),
+        Some("Messaging") => Some(3),
+        Some("Mail") => Some(12),
+        _ => None,
+    }
+}
+
+fn app_index(name: &str) -> Option<usize> {
+    APPS.iter().position(|app| app.name == name)
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            version: CONFIG_VERSION,
+            dark: default_dark(),
+            accent: default_accent(),
+            wallpaper: 0,
+            gap: DEFAULT_GAP,
+            tile_alpha: 1.0,
+            brightness: 1.0,
+            tiles: default_tiles(),
+        }
+    }
+}
+
+impl Config {
+    /// Clamp hand-edited values and drop tiles that name an unknown app.
+    fn sanitized(mut self) -> Self {
+        self.wallpaper = self.wallpaper.min(WALLPAPER_NAMES.len() - 1);
+        self.gap = self.gap.clamp(GAP_MIN, GAP_MAX);
+        self.tile_alpha = self.tile_alpha.clamp(TILE_ALPHA_MIN, 1.0);
+        self.brightness = self.brightness.clamp(0.05, 1.0);
+        self.tiles.retain(|tile| app_index(&tile.app).is_some());
+        if self.tiles.is_empty() {
+            self.tiles = default_tiles();
+        }
+        self
+    }
+}
+
+/// `$HORN_CONFIG` wins, then the usual per-OS user config directory:
+/// `%APPDATA%\horn\config.json`, `~/Library/Application Support/horn/config.json`
+/// or `$XDG_CONFIG_HOME|~/.config/horn/config.json`.
+fn config_path() -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os("HORN_CONFIG") {
+        return Some(PathBuf::from(path));
+    }
+    let base = if cfg!(target_os = "windows") {
+        std::env::var_os("APPDATA").map(PathBuf::from)
+    } else if cfg!(target_os = "macos") {
+        std::env::var_os("HOME").map(|home| PathBuf::from(home).join("Library/Application Support"))
+    } else {
+        std::env::var_os("XDG_CONFIG_HOME")
+            .map(PathBuf::from)
+            .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+    }?;
+    Some(base.join("horn").join("config.json"))
+}
+
+fn load_config() -> Option<Config> {
+    let path = config_path()?;
+    let text = std::fs::read_to_string(&path).ok()?;
+    match serde_json::from_str::<Config>(&text) {
+        Ok(config) => Some(config.sanitized()),
+        Err(err) => {
+            eprintln!("horn: ignoring unreadable {}: {err}", path.display());
+            None
+        }
+    }
+}
+
+/// Write to a temp file and rename over the old one, so an interrupted save
+/// can never leave a truncated config behind.
+fn save_config(config: &Config) {
+    let Some(path) = config_path() else { return };
+    let Some(dir) = path.parent() else { return };
+    if let Err(err) = std::fs::create_dir_all(dir) {
+        eprintln!("horn: could not create {}: {err}", dir.display());
+        return;
+    }
+    let Ok(json) = serde_json::to_string_pretty(config) else {
+        return;
+    };
+    let tmp = path.with_extension("json.tmp");
+    if let Err(err) = std::fs::write(&tmp, json) {
+        eprintln!("horn: could not write {}: {err}", tmp.display());
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp, &path) {
+        eprintln!("horn: could not replace {}: {err}", path.display());
+    }
+}
+
+/// Rebuild tiles from config entries, restoring stable ids and flip stagger.
+fn tiles_from_config(configs: &[TileConfig]) -> Vec<Tile> {
+    configs
+        .iter()
+        .filter_map(|tc| app_index(&tc.app).map(|app| (app, tc.size)))
+        .enumerate()
+        .map(|(i, (app, size))| {
+            let mut tile = Tile::new(app, size, default_faces(app), default_badge(app));
+            tile.id = i;
+            tile.offset = (i as u64 * 5) % 6;
+            tile
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
 enum TileSize {
     Small,
     Medium,
@@ -263,6 +671,33 @@ enum Page {
     App(usize),
 }
 
+/// Which surface slides down from the status bar.
+#[derive(Clone, Copy, PartialEq)]
+enum PanelKind {
+    /// Quick toggles, brightness, accent — pulled from the right half.
+    System,
+    /// Notification list — pulled from the left half.
+    Notifications,
+}
+
+/// Slider currently being dragged (the pointer is tracked on the root).
+#[derive(Clone, Copy, PartialEq)]
+enum Drag {
+    Brightness,
+    Gap,
+    Opacity,
+}
+
+/// Description of one labelled slider row.
+struct Slider {
+    id: &'static str,
+    kind: Drag,
+    min: &'static str,
+    max: &'static str,
+    value: String,
+    ratio: f32,
+}
+
 /// Payload carried while a tile is being dragged. Also renders the drag "ghost".
 #[derive(Clone)]
 struct DraggedTile {
@@ -299,6 +734,8 @@ struct Metro {
     accent: u32,
     dark: bool,
     page: Page,
+    prev_page: Option<Page>,
+    page_morph: bool,
     history: Vec<Page>,
     nav: usize,          // bumps on every navigation so the page-in animation replays
     edit: Option<usize>, // id of the tile in edit mode
@@ -313,11 +750,12 @@ struct Metro {
     scale: f32,
     last_w: f32,
     resizing: bool,
-    // control panel (swipe down from the status bar)
-    panel_open: bool,
-    panel_anim: usize,
-    pull_start: Option<f32>,
-    bright_drag: bool,
+    // panels (swipe down from the status bar)
+    panel: Option<PanelKind>,
+    panel_closing: bool,
+    panel_token: usize,
+    pull_start: Option<(f32, f32)>,
+    drag: Option<Drag>,
     brightness: f32,
     wifi: bool,
     bluetooth: bool,
@@ -325,132 +763,24 @@ struct Metro {
     quiet: bool,
     night_light: bool,
     battery_saver: bool,
-    // wallpaper preset
+    notes_cleared: bool,
+    // appearance
     wallpaper: usize,
+    gap: f32,
+    tile_alpha: f32,
+    // app search
+    search: String,
+    search_focus: FocusHandle,
+    search_pending: bool,
+    // debounced config persistence
+    save_token: usize,
 }
 
 impl Metro {
     fn new(cx: &mut Context<Self>) -> Self {
-        use Face::*;
-        use TileSize::*;
-        let mut tiles = vec![
-            Tile::new(0, Medium, vec![Icon], Some(2)),
-            Tile::new(
-                1,
-                Medium,
-                vec![
-                    Mosaic([0xD80073, 0x6A00FF, 0x00ABA9, 0xFA6800]),
-                    Text {
-                        head: "Sara",
-                        body: "is now on Numerals",
-                    },
-                ],
-                None,
-            ),
-            Tile::new(
-                2,
-                Wide,
-                vec![
-                    Icon,
-                    Text {
-                        head: "Numerals",
-                        body: "Hey! Did you try the new live tiles yet?",
-                    },
-                    Text {
-                        head: "Fishmind Labs",
-                        body: "Build 0.9 is ready for the private beta.",
-                    },
-                ],
-                Some(3),
-            ),
-            Tile::new(
-                3,
-                Medium,
-                vec![
-                    Icon,
-                    Text {
-                        head: "Fishmind Labs",
-                        body: "Weekly build report",
-                    },
-                ],
-                Some(12),
-            ),
-            Tile::new(
-                4,
-                Medium,
-                vec![
-                    Big {
-                        value: "18",
-                        caption: "Wednesday",
-                    },
-                    Text {
-                        head: "Up next",
-                        body: "Design review · 4:30 PM",
-                    },
-                ],
-                None,
-            ),
-            Tile::new(
-                8,
-                Wide,
-                vec![
-                    Big {
-                        value: "24°",
-                        caption: "Sunny",
-                    },
-                    Text {
-                        head: "Tomorrow",
-                        body: "22° · Partly cloudy",
-                    },
-                    Text {
-                        head: "Weekend",
-                        body: "Light rain on Saturday",
-                    },
-                ],
-                None,
-            ),
-            Tile::new(11, Medium, vec![Clock], None),
-            Tile::new(
-                6,
-                Medium,
-                vec![
-                    Icon,
-                    Text {
-                        head: "Now playing",
-                        body: "Neon Rain — Fishmind",
-                    },
-                ],
-                None,
-            ),
-            Tile::new(
-                5,
-                Wide,
-                vec![Mosaic([0x008A00, 0x1BA1E2, 0xF0A30A, 0xA20025]), Icon],
-                None,
-            ),
-            Tile::new(
-                7,
-                Medium,
-                vec![
-                    Icon,
-                    Big {
-                        value: "12",
-                        caption: "updates",
-                    },
-                ],
-                None,
-            ),
-            Tile::new(9, Small, vec![Icon], None),
-            Tile::new(10, Small, vec![Icon], None),
-            Tile::new(14, Small, vec![Icon], None),
-            Tile::new(15, Small, vec![Icon], None),
-            Tile::new(SETTINGS, Medium, vec![Icon], None),
-            Tile::new(13, Wide, vec![Icon], None),
-        ];
-        for (i, t) in tiles.iter_mut().enumerate() {
-            t.id = i;
-            t.offset = (i as u64 * 5) % 6; // stagger the flips
-        }
+        // Restore the last session; a missing or broken file means first run.
+        let config = load_config().unwrap_or_default();
+        let tiles = tiles_from_config(&config.tiles);
         let next_id = tiles.len();
 
         // 1 Hz heartbeat: clock + live-tile flips
@@ -467,9 +797,11 @@ impl Metro {
         let mut me = Metro {
             tiles,
             next_id,
-            accent: 0xA4C400,
-            dark: true,
+            accent: config.accent,
+            dark: config.dark,
             page: Page::Start,
+            prev_page: None,
+            page_morph: false,
             history: vec![],
             nav: 0,
             edit: None,
@@ -483,18 +815,26 @@ impl Metro {
             scale: 1.0,
             last_w: 0.0,
             resizing: false,
-            panel_open: true,
-            panel_anim: 1,
+            panel: None,
+            panel_closing: false,
+            panel_token: 0,
             pull_start: None,
-            bright_drag: false,
-            brightness: 1.0,
+            drag: None,
+            brightness: config.brightness,
             wifi: true,
             bluetooth: false,
             airplane: false,
             quiet: false,
             night_light: false,
             battery_saver: false,
-            wallpaper: 0,
+            notes_cleared: false,
+            wallpaper: config.wallpaper,
+            gap: config.gap,
+            tile_alpha: config.tile_alpha,
+            search: String::new(),
+            search_focus: cx.focus_handle(),
+            search_pending: false,
+            save_token: 0,
         };
         me.stamp();
         me
@@ -529,10 +869,11 @@ impl Metro {
 
     /// Pick an even column count (≥ 4) and a cell size so the grid exactly fills the window.
     fn relayout(&mut self, width: f32) {
+        let gap = self.gap;
         let avail = (width - 2.0 * MARGIN).max(200.0);
         let cols =
-            ((((avail + GAP) / (TARGET_CELL + GAP)) / 2.0).round() as usize * 2).clamp(4, 16);
-        self.cell = (avail - GAP * (cols as f32 - 1.0)) / cols as f32;
+            ((((avail + gap) / (TARGET_CELL + gap)) / 2.0).round() as usize * 2).clamp(4, 16);
+        self.cell = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
         self.cols = cols;
         self.scale = (self.cell / 70.0).clamp(0.85, 1.5);
         self.resizing = (width - self.last_w).abs() > 0.5;
@@ -613,6 +954,7 @@ impl Metro {
             let t = self.tiles.remove(from);
             self.tiles.insert(to, t);
         }
+        self.save_soon(cx);
         cx.notify();
     }
 
@@ -621,6 +963,68 @@ impl Metro {
             let t = self.tiles.remove(from);
             self.tiles.push(t);
         }
+        self.save_soon(cx);
+        cx.notify();
+    }
+
+    // ── persistence ──
+
+    /// Snapshot of everything worth keeping between runs.
+    fn config(&self) -> Config {
+        Config {
+            version: CONFIG_VERSION,
+            dark: self.dark,
+            accent: self.accent,
+            wallpaper: self.wallpaper,
+            gap: self.gap,
+            tile_alpha: self.tile_alpha,
+            brightness: self.brightness,
+            tiles: self
+                .tiles
+                .iter()
+                .map(|t| TileConfig {
+                    app: APPS[t.app].name.to_string(),
+                    size: t.size,
+                })
+                .collect(),
+        }
+    }
+
+    /// Debounced save: slider drags and rapid edits collapse into one write.
+    fn save_soon(&mut self, cx: &mut Context<Self>) {
+        self.save_token = self.save_token.wrapping_add(1);
+        let token = self.save_token;
+        let config = self.config();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(400))
+                .await;
+            let still_current = this
+                .update(cx, |this, _| this.save_token == token)
+                .unwrap_or(false);
+            if still_current {
+                save_config(&config);
+            }
+        })
+        .detach();
+    }
+
+    fn rebuild_tiles(&mut self, configs: &[TileConfig]) {
+        self.tiles = tiles_from_config(configs);
+        self.next_id = self.tiles.len();
+        self.edit = None;
+    }
+
+    fn reset_config(&mut self, cx: &mut Context<Self>) {
+        let defaults = Config::default();
+        self.dark = defaults.dark;
+        self.accent = defaults.accent;
+        self.wallpaper = defaults.wallpaper;
+        self.gap = defaults.gap;
+        self.tile_alpha = defaults.tile_alpha;
+        self.brightness = defaults.brightness;
+        self.rebuild_tiles(&defaults.tiles);
+        self.save_soon(cx);
         cx.notify();
     }
 
@@ -631,71 +1035,174 @@ impl Metro {
             return;
         }
         self.history.push(self.page);
+        self.flip_to(page, cx);
+    }
+
+    /// Swap pages with the book-page (Windows Phone) reveal: the outgoing page is
+    /// kept alive for the duration of the peel, then dropped.
+    fn flip_to(&mut self, page: Page, cx: &mut Context<Self>) {
+        self.prev_page = Some(self.page);
         self.page = page;
         self.nav += 1;
         self.edit = None;
+        self.page_morph = true;
+        if page == Page::Apps {
+            self.search_pending = true;
+        }
+        let token = self.nav;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(460))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.nav == token {
+                    this.page_morph = false;
+                    this.prev_page = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
         cx.notify();
     }
 
     fn back(&mut self, cx: &mut Context<Self>) {
-        if self.panel_open {
-            self.panel_open = false;
+        if self.panel.is_some() {
+            self.close_panel(cx);
         } else if self.edit.is_some() {
             self.edit = None;
+            cx.notify();
         } else if self.page != Page::Start {
-            self.page = self.history.pop().unwrap_or(Page::Start);
-            self.nav += 1;
+            let prev = self.history.pop().unwrap_or(Page::Start);
+            self.flip_to(prev, cx);
+        } else {
+            cx.notify();
         }
-        cx.notify();
     }
 
     fn home(&mut self, cx: &mut Context<Self>) {
         self.history.clear();
-        self.page = Page::Start;
-        self.edit = None;
-        self.nav += 1;
-        cx.notify();
+        if self.page != Page::Start {
+            self.flip_to(Page::Start, cx);
+        } else {
+            self.edit = None;
+            cx.notify();
+        }
+    }
+
+    fn open_app(&mut self, app: usize, cx: &mut Context<Self>) {
+        // Dismiss any panel immediately; the page flip covers the switch.
+        self.panel = None;
+        self.panel_closing = false;
+        self.panel_token += 1;
+        self.go(
+            if app == SETTINGS {
+                Page::Settings
+            } else {
+                Page::App(app)
+            },
+            cx,
+        );
     }
 
     fn toggle_pin(&mut self, app: usize, cx: &mut Context<Self>) {
         if let Some(pos) = self.tiles.iter().position(|t| t.app == app) {
             self.tiles.remove(pos);
         } else {
-            let mut t = Tile::new(app, TileSize::Medium, vec![Face::Icon], None);
+            let mut t = Tile::new(
+                app,
+                TileSize::Medium,
+                default_faces(app),
+                default_badge(app),
+            );
             t.id = self.next_id;
             self.next_id += 1;
             t.offset = self.secs;
             self.tiles.push(t);
         }
+        self.save_soon(cx);
         cx.notify();
     }
 
-    // ── control panel ──
+    // ── panels ──
 
-    fn open_panel(&mut self, cx: &mut Context<Self>) {
-        if !self.panel_open {
-            self.panel_open = true;
-            self.panel_anim += 1;
-            self.edit = None;
-            cx.notify();
-        }
+    fn open_panel(&mut self, kind: PanelKind, cx: &mut Context<Self>) {
+        self.panel = Some(kind);
+        self.panel_closing = false;
+        self.panel_token += 1;
+        self.edit = None;
+        self.pull_start = None;
+        cx.notify();
     }
 
+    /// Dismiss with the slide-up animation; the panel stays mounted until it has
+    /// travelled out of view, so the exit is animated instead of popping away.
     fn close_panel(&mut self, cx: &mut Context<Self>) {
-        if self.panel_open {
-            self.panel_open = false;
-            self.pull_start = None;
-            self.bright_drag = false;
-            cx.notify();
+        if self.panel.is_none() || self.panel_closing {
+            return;
+        }
+        self.panel_closing = true;
+        self.pull_start = None;
+        self.drag = None;
+        self.panel_token += 1;
+        let token = self.panel_token;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(360))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.panel_token == token {
+                    this.panel = None;
+                    this.panel_closing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Left half of the status bar = notifications, right half = system panel.
+    fn panel_for_x(&self, x: f32) -> PanelKind {
+        if x < self.measured_w * 0.5 {
+            PanelKind::Notifications
+        } else {
+            PanelKind::System
         }
     }
 
-    /// Map a pointer x-position onto the brightness track (sun icons + padding included).
-    fn set_brightness_from_x(&mut self, x: f32) {
-        // 15px left sun + 10px gap on the left, 21px right sun + 10px gap on the right.
-        let left = PANEL_PAD + 25.0;
-        let track = (self.measured_w - 2.0 * PANEL_PAD - 56.0).max(1.0);
-        self.brightness = ((x - left) / track).clamp(0.05, 1.0);
+    fn toggle_panel(&mut self, x: f32, cx: &mut Context<Self>) {
+        let kind = self.panel_for_x(x);
+        if self.panel == Some(kind) {
+            self.close_panel(cx);
+        } else {
+            self.open_panel(kind, cx);
+        }
+    }
+
+    // ── sliders ──
+
+    /// Map a pointer x-position onto the slider being dragged. Settings sliders
+    /// live in a centred, max-width column; the panel slider spans the panel.
+    fn apply_drag(&mut self, kind: Drag, x: f32) {
+        let (left, track) = match kind {
+            Drag::Brightness => (
+                PANEL_PAD + 34.0,
+                (self.measured_w - 2.0 * PANEL_PAD - 34.0 - 92.0).max(1.0),
+            ),
+            Drag::Gap | Drag::Opacity => {
+                let avail = (self.measured_w - 2.0 * MARGIN).max(0.0);
+                let column = avail.min(560.0);
+                let offset = MARGIN + (avail - column) * 0.5;
+                (offset + 34.0, (column - 34.0 - 92.0).max(1.0))
+            }
+        };
+        let t = ((x - left) / track).clamp(0.0, 1.0);
+        match kind {
+            Drag::Brightness => self.brightness = 0.05 + t * 0.95,
+            Drag::Gap => self.gap = GAP_MIN + t * (GAP_MAX - GAP_MIN),
+            Drag::Opacity => self.tile_alpha = TILE_ALPHA_MIN + t * (1.0 - TILE_ALPHA_MIN),
+        }
     }
 
     fn toggle_wifi(&mut self) {
@@ -767,22 +1274,96 @@ impl Metro {
             )
     }
 
-    fn control_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+    /// One labelled slider row: min label, track, value, max label.
+    fn slider(&self, spec: Slider, cx: &mut Context<Self>) -> Div {
+        let Slider {
+            id,
+            kind,
+            min,
+            max,
+            value,
+            ratio,
+        } = spec;
         let fg = self.fg();
         let accent: Hsla = rgb(self.accent).into();
-        let viewport_h = f32::from(window.viewport_size().height);
-        let panel_h = (viewport_h * 0.64).clamp(360.0, 500.0);
-        let scrim_h = (viewport_h - panel_h).max(0.0);
+        let ratio = ratio.clamp(0.0, 1.0);
+        div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .w(px(24.0))
+                    .text_size(px(10.0))
+                    .text_color(fg.opacity(0.55))
+                    .child(min),
+            )
+            .child(
+                div()
+                    .id(id)
+                    .relative()
+                    .flex_1()
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                            this.drag = Some(kind);
+                            this.apply_drag(kind, f32::from(e.position.x));
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(4.0))
+                            .bg(self.cell_bg())
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.0))
+                                    .top(px(0.0))
+                                    .h_full()
+                                    .w(relative(ratio))
+                                    .bg(accent)
+                                    .child(
+                                        div()
+                                            .absolute()
+                                            .right(px(-8.0))
+                                            .top(px(-6.0))
+                                            .size(px(16.0))
+                                            .rounded_full()
+                                            .bg(accent),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .w(px(44.0))
+                    .text_size(px(11.0))
+                    .text_color(fg.opacity(0.75))
+                    .child(value),
+            )
+            .child(
+                div()
+                    .w(px(28.0))
+                    .text_size(px(10.0))
+                    .text_color(fg.opacity(0.5))
+                    .child(max),
+            )
+    }
 
-        let caption = |text: &'static str| {
-            div()
-                .mt(px(6.0))
-                .text_size(px(11.0))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(fg.opacity(0.55))
-                .child(text)
-        };
-
+    fn panel_heading(
+        &self,
+        overline: &'static str,
+        title: &'static str,
+        cx: &mut Context<Self>,
+    ) -> Div {
+        let fg = self.fg();
         let close = div()
             .id("panel-close")
             .size(px(34.0))
@@ -796,7 +1377,7 @@ impl Metro {
             .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx)))
             .child(glyph(IconName::ChevronUp, 20.0, fg));
 
-        let header = div()
+        div()
             .flex()
             .items_center()
             .justify_between()
@@ -809,17 +1390,30 @@ impl Metro {
                             .text_size(px(10.0))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(fg.opacity(0.55))
-                            .child("ACTION CENTER"),
+                            .child(overline),
                     )
                     .child(
                         div()
-                            .text_size(px(30.0))
-                            .line_height(px(34.0))
+                            .text_size(px(28.0))
+                            .line_height(px(32.0))
                             .font_weight(FontWeight::LIGHT)
-                            .child("control panel"),
+                            .child(title),
                     ),
             )
-            .child(close);
+            .child(close)
+    }
+
+    /// System panel: quick toggles, brightness, accent + theme shortcuts.
+    fn system_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let fg = self.fg();
+        let caption = |text: &'static str| {
+            div()
+                .mt(px(4.0))
+                .text_size(px(11.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(fg.opacity(0.55))
+                .child(text)
+        };
 
         let row1 = div()
             .flex()
@@ -893,59 +1487,17 @@ impl Metro {
                 cx,
             ));
 
-        let brightness_head = div()
-            .flex()
-            .items_center()
-            .justify_between()
-            .child(caption("BRIGHTNESS"))
-            .child(
-                div()
-                    .mt(px(6.0))
-                    .text_size(px(11.0))
-                    .text_color(fg.opacity(0.7))
-                    .child(format!("{}%", (self.brightness * 100.0).round() as u32)),
-            );
-
-        let brightness = div()
-            .flex()
-            .items_center()
-            .gap(px(10.0))
-            .child(glyph(IconName::Sun, 15.0, fg.opacity(0.55)))
-            .child(
-                div()
-                    .id("brightness-track")
-                    .relative()
-                    .flex_1()
-                    .h(px(26.0))
-                    .flex()
-                    .items_center()
-                    .cursor_pointer()
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
-                            this.bright_drag = true;
-                            this.set_brightness_from_x(f32::from(e.position.x));
-                            cx.notify();
-                        }),
-                    )
-                    .child(
-                        div()
-                            .relative()
-                            .w_full()
-                            .h(px(4.0))
-                            .bg(self.cell_bg())
-                            .child(
-                                div()
-                                    .absolute()
-                                    .left(px(0.0))
-                                    .top(px(0.0))
-                                    .h_full()
-                                    .w(relative(self.brightness))
-                                    .bg(accent),
-                            ),
-                    ),
-            )
-            .child(glyph(IconName::Sun, 21.0, fg.opacity(0.9)));
+        let brightness = self.slider(
+            Slider {
+                id: "brightness-track",
+                kind: Drag::Brightness,
+                min: "0",
+                max: "100",
+                value: format!("{}%", (self.brightness * 100.0).round() as u32),
+                ratio: self.brightness,
+            },
+            cx,
+        );
 
         let swatches: Vec<Stateful<Div>> = ACCENTS
             .iter()
@@ -962,6 +1514,7 @@ impl Metro {
                     .when(self.accent == c, |d| d.border_2().border_color(fg))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.accent = c;
+                        this.save_soon(cx);
                         cx.notify();
                     }))
             })
@@ -991,95 +1544,266 @@ impl Metro {
             } else {
                 IconName::Moon
             },
-            if self.dark { "light mode" } else { "dark mode" },
+            if self.dark { "Light mode" } else { "Dark mode" },
         )
         .on_click(cx.listener(|this, _, _, cx| {
             this.dark = !this.dark;
+            this.save_soon(cx);
             cx.notify();
         }));
 
-        let settings_btn = panel_button("panel-settings", IconName::Settings, "all settings")
+        let settings_btn = panel_button("panel-settings", IconName::Settings, "All settings")
             .on_click(cx.listener(|this, _, _, cx| {
-                this.panel_open = false;
+                this.close_panel(cx);
                 this.go(Page::Settings, cx);
+            }));
+
+        div()
+            .id("panel-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .px(px(PANEL_PAD))
+            .pt(px(STATUS_H + 10.0))
+            .pb(px(PANEL_PAD))
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(self.panel_heading("Action Center", "Control Panel", cx))
+            .child(caption("Quick Actions"))
+            .child(row1)
+            .child(row2)
+            .child(caption("Brightness"))
+            .child(brightness)
+            .child(caption("Accent"))
+            .child(div().flex().flex_wrap().gap(px(6.0)).children(swatches))
+            .child(div().flex_1())
+            .child(
+                div()
+                    .flex()
+                    .gap(px(8.0))
+                    .child(theme_btn)
+                    .child(settings_btn),
+            )
+    }
+
+    /// Notification panel: swipe down from the left half of the status bar.
+    fn notifications_panel(&self, cx: &mut Context<Self>) -> Stateful<Div> {
+        let fg = self.fg();
+
+        let clear = div()
+            .id("notes-clear")
+            .px(px(12.0))
+            .h(px(30.0))
+            .flex()
+            .items_center()
+            .gap(px(6.0))
+            .bg(self.cell_bg())
+            .rounded(px(2.0))
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .child(glyph(IconName::X, 13.0, fg.opacity(0.75)))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .text_color(fg.opacity(0.8))
+                    .child("Clear all"),
+            )
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.notes_cleared = true;
                 cx.notify();
             }));
+
+        let body: Div = if self.notes_cleared {
+            div()
+                .flex_1()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap(px(8.0))
+                .child(glyph(IconName::BellOff, 30.0, fg.opacity(0.35)))
+                .child(
+                    div()
+                        .text_size(px(13.0))
+                        .text_color(fg.opacity(0.55))
+                        .child("You're all caught up"),
+                )
+        } else {
+            let mut rows: Vec<AnyElement> = Vec::with_capacity(NOTES.len());
+            for (i, n) in NOTES.iter().enumerate() {
+                rows.push(self.note_row(n, i, cx).into_any_element());
+            }
+            div().flex().flex_col().children(rows)
+        };
+
+        div()
+            .id("notes-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .px(px(PANEL_PAD))
+            .pt(px(STATUS_H + 10.0))
+            .pb(px(PANEL_PAD))
+            .flex()
+            .flex_col()
+            .gap(px(6.0))
+            .child(self.panel_heading("Notifications", "Notifications", cx))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_size(px(11.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg.opacity(0.55))
+                            .child(if self.notes_cleared {
+                                "No new notifications"
+                            } else {
+                                "New in the last 24 hours"
+                            }),
+                    )
+                    .child(clear),
+            )
+            .child(body)
+            .child(div().flex_1())
+    }
+
+    fn note_row(&self, n: &Note, i: usize, cx: &mut Context<Self>) -> impl IntoElement {
+        let fg = self.fg();
+        let a = &APPS[n.app];
+        let hex = a.color.unwrap_or(self.accent);
+        let app = n.app;
+        div()
+            .id(("note", i))
+            .flex()
+            .items_start()
+            .gap(px(10.0))
+            .py(px(8.0))
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(move |this, _, _, cx| this.open_app(app, cx)))
+            .child(
+                div()
+                    .size(px(34.0))
+                    .rounded(px(3.0))
+                    .bg(rgb(hex))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(glyph(a.icon, 17.0, on_color(hex))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(2.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .child(n.title),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(10.0))
+                                    .text_color(fg.opacity(0.5))
+                                    .child(n.when),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .line_height(px(15.0))
+                            .text_color(fg.opacity(0.72))
+                            .child(n.body),
+                    ),
+            )
+    }
+
+    /// The sliding surface itself. It is mounted while a panel is open (or still
+    /// animating out) and driven by a reversible `transition`, so both the
+    /// slide-down and the dismiss slide-up are smooth and follow live values.
+    fn panel_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let viewport_h = f32::from(window.viewport_size().height);
+        let panel_h = (viewport_h * 0.66).clamp(320.0, 560.0);
+        let open = self.panel.is_some() && !self.panel_closing;
+
+        let slide = transition(
+            ("panel", "slide"),
+            if open { panel_h } else { 0.0 },
+            Transition::new(Duration::from_millis(320)).easing(Easing::EaseInOut),
+            window,
+            cx,
+        );
+        let scrim = transition(
+            ("panel", "scrim"),
+            if open { 1.0f32 } else { 0.0 },
+            Transition::new(Duration::from_millis(260)).easing(Easing::EaseInOut),
+            window,
+            cx,
+        );
+
+        if slide < 0.5 {
+            return None;
+        }
+        let slide = slide.clamp(0.0, panel_h);
+        let top = slide - panel_h;
 
         let scrim = div()
             .id("panel-scrim")
             .absolute()
             .left(px(0.0))
-            .top(px(panel_h))
+            .top(px(slide))
             .w_full()
-            .h(px(scrim_h))
-            .bg(hsla(0.0, 0.0, 0.0, if self.dark { 0.5 } else { 0.28 }))
+            .h(px((viewport_h - slide).max(0.0)))
+            .bg(hsla(
+                0.0,
+                0.0,
+                0.0,
+                scrim * if self.dark { 0.55 } else { 0.3 },
+            ))
             .occlude()
-            .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx)));
+            .when(open, |d| {
+                d.on_click(cx.listener(|this, _, _, cx| this.close_panel(cx)))
+            });
+
+        let content = match self.panel {
+            Some(PanelKind::Notifications) => self.notifications_panel(cx),
+            _ => self.system_panel(cx),
+        };
 
         let panel = div()
+            .id("panel")
             .absolute()
             .left(px(0.0))
-            .top(px(0.0))
+            .top(px(top))
             .w_full()
             .h(px(panel_h))
             .bg(self.panel_bg())
             .border_b_1()
-            .border_color(fg.opacity(0.12))
+            .border_color(self.fg().opacity(0.12))
             .shadow_lg()
             .occlude()
-            // Brightness drag is tracked here because the occluding panel owns the
-            // pointer while it is open; the root underneath does not receive moves.
-            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
-                if this.bright_drag {
-                    this.set_brightness_from_x(f32::from(e.position.x));
-                    cx.notify();
-                }
-            }))
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, _| this.bright_drag = false),
-            )
-            .child(
-                div()
-                    .id("panel-scroll")
-                    .size_full()
-                    .overflow_y_scroll()
-                    .px(px(PANEL_PAD))
-                    .pt(px(34.0))
-                    .pb(px(PANEL_PAD))
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(header)
-                    .child(caption("QUICK ACTIONS"))
-                    .child(row1)
-                    .child(row2)
-                    .child(brightness_head)
-                    .child(brightness)
-                    .child(caption("ACCENT"))
-                    .child(div().flex().flex_wrap().gap(px(6.0)).children(swatches))
-                    .child(div().flex_1())
-                    .child(
-                        div()
-                            .flex()
-                            .gap(px(8.0))
-                            .child(theme_btn)
-                            .child(settings_btn),
-                    ),
-            )
-            .with_animation(
-                ("panel-in", self.panel_anim),
-                Animation::new(Duration::from_millis(260)).with_easing(ease_out_quint()),
-                move |el, d| el.top(px(-panel_h * (1.0 - d))).opacity(d),
-            );
+            .child(content);
 
-        div()
-            .absolute()
-            .left(px(0.0))
-            .top(px(0.0))
-            .size_full()
-            .child(scrim)
-            .child(panel)
+        Some(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .size_full()
+                .child(scrim)
+                .child(panel)
+                .into_any_element(),
+        )
     }
 
     // ── wallpaper ──
@@ -1205,8 +1929,12 @@ fn label(name: &'static str, s: f32) -> Div {
     div()
         .absolute()
         .left(px(10.0 * s))
+        .right(px(8.0 * s))
         .bottom(px(8.0 * s))
         .text_size(px(13.0 * s))
+        .line_height(px(15.0 * s))
+        .whitespace_nowrap()
+        .text_ellipsis()
         .child(name)
 }
 
@@ -1234,11 +1962,17 @@ fn pivot_header(small: String, big: String) -> Div {
 }
 
 impl Metro {
-    fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// Always painted above everything else (see `render`): it never hides on its
+    /// own and stays visible while a panel is slid down underneath it.
+    fn status_bar(&self, cx: &mut Context<Self>) -> AnyElement {
         let fg = self.fg();
         div()
             .id("status-bar")
-            .h(px(26.0))
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .w_full()
+            .h(px(STATUS_H))
             .px(px(10.0))
             .flex()
             .items_center()
@@ -1251,7 +1985,22 @@ impl Metro {
                 hsla(0.0, 0.0, 1.0, 0.40)
             })
             .cursor_pointer()
-            .on_click(cx.listener(|this, _, _, cx| this.open_panel(cx)))
+            // Press starts a potential pull; a short downward drag opens the
+            // panel for the half of the bar the gesture began on.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _, _| {
+                    this.pull_start = Some((f32::from(e.position.x), f32::from(e.position.y)));
+                }),
+            )
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    if this.pull_start.take().is_some() {
+                        this.toggle_panel(f32::from(e.position.x), cx);
+                    }
+                }),
+            )
             .child(
                 div()
                     .flex()
@@ -1282,6 +2031,7 @@ impl Metro {
                     )
                     .child(self.time.clone()),
             )
+            .into_any_element()
     }
 
     fn nav_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1327,7 +2077,15 @@ impl Metro {
             .child(
                 btn("nav-search")
                     .child(glyph(IconName::Search, 24.0, fg))
-                    .on_click(cx.listener(|this, _, _, cx| this.go(Page::Apps, cx))),
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.page == Page::Apps {
+                            // Already there: put the caret back in the search field.
+                            this.search_pending = true;
+                            cx.notify();
+                        } else {
+                            this.go(Page::Apps, cx);
+                        }
+                    })),
             )
     }
 
@@ -1342,6 +2100,7 @@ impl Metro {
             .top(px(0.0))
             .left(px(0.0))
             .size_full()
+            .overflow_hidden()
             .text_color(ink);
 
         match face {
@@ -1377,11 +2136,14 @@ impl Metro {
                     div()
                         .text_size(px(17.0 * s))
                         .font_weight(FontWeight::SEMIBOLD)
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .child(*head),
                 )
                 .child(
                     div()
                         .text_size(px(13.0 * s))
+                        .line_height(px(16.0 * s))
                         .text_color(ink.opacity(0.82))
                         .child(*body),
                 )
@@ -1391,9 +2153,13 @@ impl Metro {
                     div()
                         .absolute()
                         .left(px(10.0 * s))
-                        .top(px(14.0 * s))
-                        .text_size(px(60.0 * s))
+                        .right(px(10.0 * s))
+                        .top(px(16.0 * s))
+                        .text_size(px((56.0 * s).min(64.0)))
+                        .line_height(px((60.0 * s).min(68.0)))
                         .font_weight(FontWeight::LIGHT)
+                        .whitespace_nowrap()
+                        .text_ellipsis()
                         .child(*value),
                 )
                 .child(label(caption, s)),
@@ -1416,19 +2182,39 @@ impl Metro {
                     }))
                     .child(label(app.name, s).text_color(caption_ink))
             }
-            Face::Clock => base
-                .flex()
-                .flex_col()
-                .items_center()
-                .justify_center()
-                .child(
-                    div()
-                        .text_size(px(46.0 * s))
-                        .font_weight(FontWeight::LIGHT)
-                        .child(self.time.clone()),
-                )
-                .child(div().text_size(px(12.0 * s)).child(self.date.clone()))
-                .child(label(app.name, s)),
+            Face::Clock => {
+                // The clock owns a 2×2 tile; keep the type small enough that the
+                // time and the (long) date line can never spill past the window.
+                base.flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .p(px(10.0 * s))
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px((32.0 * s).min(40.0)))
+                            .line_height(px((36.0 * s).min(44.0)))
+                            .font_weight(FontWeight::LIGHT)
+                            .text_center()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(self.time.clone()),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .mt(px(2.0 * s))
+                            .text_size(px((10.0 * s).min(13.0)))
+                            .line_height(px((13.0 * s).min(16.0)))
+                            .text_color(ink.opacity(0.8))
+                            .text_center()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(self.date.clone()),
+                    )
+                    .child(label(app.name, s))
+            }
         }
     }
 
@@ -1476,7 +2262,7 @@ impl Metro {
         let t = &self.tiles[ix];
         let id = t.id;
         let (cw, ch) = t.size.cells();
-        let (cell, g) = (self.cell, GAP);
+        let (cell, g) = (self.cell, self.gap);
 
         // target geometry from the packer …
         let tx = pos.0 as f32 * (cell + g);
@@ -1491,7 +2277,7 @@ impl Metro {
 
         let editing = self.edit == Some(id);
         let color_hex = APPS[t.app].color.unwrap_or(self.accent);
-        let color = rgb(color_hex);
+        let color = rgb(color_hex).opacity(self.tile_alpha);
         let ink = on_color(color_hex);
         let inverse = inverse_ink(color_hex);
         let content = self.tile_content(t, h);
@@ -1540,14 +2326,7 @@ impl Metro {
                     cx.notify();
                 } else if let Some(t) = this.tiles.iter().find(|t| t.id == id) {
                     let a = t.app;
-                    this.go(
-                        if a == SETTINGS {
-                            Page::Settings
-                        } else {
-                            Page::App(a)
-                        },
-                        cx,
-                    );
+                    this.open_app(a, cx);
                 }
             }))
             // Drag to replace (edit mode only): ghost follows the pointer, target highlights.
@@ -1580,6 +2359,7 @@ impl Metro {
                                 .on_click(cx.listener(move |this, _, _, cx| {
                                     this.tiles.retain(|t| t.id != id);
                                     this.edit = None;
+                                    this.save_soon(cx);
                                     cx.stop_propagation();
                                     cx.notify();
                                 })),
@@ -1592,6 +2372,7 @@ impl Metro {
                                     if let Some(t) = this.tiles.iter_mut().find(|t| t.id == id) {
                                         t.size = t.size.next();
                                     }
+                                    this.save_soon(cx);
                                     cx.stop_propagation();
                                     cx.notify();
                                 })),
@@ -1616,11 +2397,11 @@ impl Metro {
                     .into_any_element()
             })
             .collect();
-        let grid_w = self.cols as f32 * self.cell + (self.cols as f32 - 1.0) * GAP;
+        let grid_w = self.cols as f32 * self.cell + (self.cols as f32 - 1.0) * self.gap;
         let grid_h = if rows == 0 {
             0.0
         } else {
-            rows as f32 * (self.cell + GAP) - GAP
+            rows as f32 * (self.cell + self.gap) - self.gap
         };
 
         div()
@@ -1667,90 +2448,204 @@ impl Metro {
             )
     }
 
-    fn apps_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    /// One row of the All Apps list: rectangular icon plate, name, pinned hint.
+    fn app_row(&self, i: usize, cx: &mut Context<Self>) -> impl IntoElement {
         let fg = self.fg();
-        let mut order: Vec<usize> = (0..APPS.len()).collect();
-        order.sort_by_key(|&i| APPS[i].name);
-
-        let rows: Vec<_> = order
-            .into_iter()
-            .map(|i| {
-                let a = &APPS[i];
-                let app_hex = a.color.unwrap_or(self.accent);
-                let pinned = self.tiles.iter().any(|t| t.app == i);
+        let a = &APPS[i];
+        let app_hex = a.color.unwrap_or(self.accent);
+        let pinned = self.tiles.iter().any(|t| t.app == i);
+        div()
+            .id(("app-row", i))
+            .flex()
+            .items_center()
+            .gap(px(14.0))
+            .py(px(8.0))
+            .cursor_pointer()
+            .active(|s| s.opacity(0.5))
+            .on_click(cx.listener(move |this, _, _, cx| this.open_app(i, cx)))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(move |this, _: &MouseDownEvent, _, cx| this.toggle_pin(i, cx)),
+            )
+            .child(
+                // Rectangular (not circular) icon border in the list view.
                 div()
-                    .id(("app-row", i))
+                    .w(px(46.0))
+                    .h(px(46.0))
+                    .rounded(px(3.0))
+                    .border_1()
+                    .border_color(fg.opacity(0.25))
+                    .bg(rgb(app_hex))
                     .flex()
                     .items_center()
-                    .gap(px(14.0))
-                    .py(px(8.0))
-                    .cursor_pointer()
-                    .active(|s| s.opacity(0.5))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.go(
-                            if i == SETTINGS {
-                                Page::Settings
-                            } else {
-                                Page::App(i)
-                            },
-                            cx,
-                        )
-                    }))
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, _: &MouseDownEvent, _, cx| this.toggle_pin(i, cx)),
-                    )
+                    .justify_center()
+                    .child(glyph(a.icon, 22.0, on_color(app_hex))),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
                     .child(
                         div()
-                            .size(px(46.0))
-                            .rounded_full()
-                            .bg(rgb(app_hex))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .child(glyph(a.icon, 22.0, on_color(app_hex))),
-                    )
-                    .child(
-                        div()
-                            .flex_1()
-                            .text_size(px(26.0))
+                            .text_size(px(22.0))
                             .font_weight(FontWeight::LIGHT)
+                            .whitespace_nowrap()
+                            .text_ellipsis()
                             .child(a.name),
                     )
                     .when(pinned, |d| {
                         d.child(
                             div()
-                                .flex()
-                                .items_center()
-                                .gap(px(6.0))
-                                .child(div().size(px(6.0)).rounded_full().bg(fg.opacity(0.55)))
-                                .child(
-                                    div()
-                                        .text_size(px(12.0))
-                                        .text_color(fg.opacity(0.65))
-                                        .child("pinned"),
-                                ),
+                                .mt(px(1.0))
+                                .text_size(px(11.0))
+                                .text_color(fg.opacity(0.5))
+                                .child("Pinned to Start"),
                         )
-                    })
+                    }),
+            )
+    }
+
+    fn apps_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let fg = self.fg();
+        let query = self.search.trim().to_lowercase();
+
+        // Filter by name / category, then group by category (declared order).
+        let mut order: Vec<usize> = (0..APPS.len())
+            .filter(|&i| {
+                query.is_empty()
+                    || APPS[i].name.to_lowercase().contains(&query)
+                    || APPS[i].category.name().to_lowercase().contains(&query)
             })
             .collect();
+        order.sort_by_key(|&i| (APPS[i].category.rank(), APPS[i].name));
+
+        let mut list: Vec<AnyElement> = Vec::new();
+        let mut current: Option<Category> = None;
+        for &i in &order {
+            let category = APPS[i].category;
+            if current != Some(category) {
+                current = Some(category);
+                list.push(
+                    div()
+                        .mt(px(16.0))
+                        .mb(px(2.0))
+                        .text_size(px(12.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg.opacity(0.55))
+                        .child(category.name())
+                        .into_any_element(),
+                );
+            }
+            list.push(self.app_row(i, cx).into_any_element());
+        }
+        if list.is_empty() {
+            list.push(
+                div()
+                    .mt(px(44.0))
+                    .w_full()
+                    .text_center()
+                    .text_size(px(13.0))
+                    .text_color(fg.opacity(0.55))
+                    .child("No apps match your search")
+                    .into_any_element(),
+            );
+        }
+
+        let searching = !self.search.is_empty();
+        let search = div()
+            .id("apps-search")
+            .track_focus(&self.search_focus)
+            .mt(px(6.0))
+            .w_full()
+            .h(px(44.0))
+            .px(px(12.0))
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .bg(self.cell_bg())
+            .rounded(px(2.0))
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, window, cx| {
+                this.search_focus.focus(window, cx);
+                cx.notify();
+            }))
+            .on_key_down(cx.listener(|this, e: &KeyDownEvent, _, cx| {
+                let m = e.keystroke.modifiers;
+                let command = m.control || m.alt || m.platform || m.function;
+                match e.keystroke.key.as_str() {
+                    "backspace" => {
+                        this.search.pop();
+                    }
+                    "escape" => this.search.clear(),
+                    _ => {
+                        if !command && let Some(text) = e.keystroke.key_char.as_deref() {
+                            this.search.push_str(text);
+                        }
+                    }
+                }
+                cx.notify();
+            }))
+            .child(glyph(IconName::Search, 17.0, fg.opacity(0.6)))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_size(px(15.0))
+                    .whitespace_nowrap()
+                    .text_ellipsis()
+                    .text_color(if searching { fg } else { fg.opacity(0.45) })
+                    .child(if searching {
+                        self.search.clone()
+                    } else {
+                        "Search apps".to_string()
+                    }),
+            )
+            .when(searching, |d| {
+                d.child(
+                    div()
+                        .id("apps-search-clear")
+                        .size(px(22.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_full()
+                        .bg(fg.opacity(0.15))
+                        .cursor_pointer()
+                        .active(|s| s.opacity(0.6))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.search.clear();
+                            cx.stop_propagation();
+                            cx.notify();
+                        }))
+                        .child(glyph(IconName::X, 12.0, fg)),
+                )
+            });
 
         div()
             .id("apps-scroll")
             .size_full()
             .overflow_y_scroll()
             .px(px(MARGIN))
-            .child(pivot_header(
-                "RIGHT-CLICK AN APP TO PIN IT".into(),
-                "apps".into(),
-            ))
-            .children(rows)
+            .child(
+                div()
+                    .w_full()
+                    .max_w(px(560.0))
+                    .mx_auto()
+                    .flex()
+                    .flex_col()
+                    .pb(px(28.0))
+                    .child(pivot_header("All Apps".into(), "Apps".into()))
+                    .child(search)
+                    .children(list),
+            )
     }
 
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let fg = self.fg();
 
-        let themes: Vec<_> = [("dark", true), ("light", false)]
+        let themes: Vec<_> = [("Dark", true), ("Light", false)]
             .into_iter()
             .map(|(name, dark)| {
                 let selected = self.dark == dark;
@@ -1764,6 +2659,7 @@ impl Metro {
                     .child(name)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.dark = dark;
+                        this.save_soon(cx);
                         cx.notify();
                     }))
             })
@@ -1781,6 +2677,7 @@ impl Metro {
                     .cursor_pointer()
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.wallpaper = i;
+                        this.save_soon(cx);
                         cx.notify();
                     }))
                     .child(
@@ -1816,38 +2713,106 @@ impl Metro {
                     .when(self.accent == c, |d| d.border_2().border_color(fg))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.accent = c;
+                        this.save_soon(cx);
                         cx.notify();
                     }))
             })
             .collect();
 
+        // `name` is a `&'static str` label; the element id needs a stable key.
         let caption = |s: &'static str| {
             div()
-                .mt(px(14.0))
+                .mt(px(16.0))
                 .mb(px(6.0))
-                .text_size(px(15.0))
+                .text_size(px(13.0))
+                .font_weight(FontWeight::SEMIBOLD)
                 .text_color(fg.opacity(0.6))
                 .child(s)
         };
+
+        let gap = self.slider(
+            Slider {
+                id: "gap-track",
+                kind: Drag::Gap,
+                min: "0",
+                max: "28",
+                value: format!("{} px", self.gap.round() as u32),
+                ratio: (self.gap - GAP_MIN) / (GAP_MAX - GAP_MIN),
+            },
+            cx,
+        );
+
+        let alpha = self.slider(
+            Slider {
+                id: "alpha-track",
+                kind: Drag::Opacity,
+                min: "0",
+                max: "100",
+                value: format!("{}%", (self.tile_alpha * 100.0).round() as u32),
+                ratio: (self.tile_alpha - TILE_ALPHA_MIN) / (1.0 - TILE_ALPHA_MIN),
+            },
+            cx,
+        );
+
+        let reset = div()
+            .id("settings-reset")
+            .mt(px(26.0))
+            .h(px(42.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .border_1()
+            .border_color(fg.opacity(0.35))
+            .rounded(px(2.0))
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .child(
+                div()
+                    .text_size(px(12.0))
+                    .text_color(fg.opacity(0.85))
+                    .child("Reset to Defaults"),
+            )
+            .on_click(cx.listener(|this, _, _, cx| this.reset_config(cx)));
 
         div()
             .id("settings-scroll")
             .size_full()
             .overflow_y_scroll()
             .px(px(MARGIN))
-            .child(pivot_header("SETTINGS".into(), "theme".into()))
-            .child(caption("theme"))
-            .child(div().flex().gap(px(24.0)).children(themes))
-            .child(caption("wallpaper"))
-            .child(div().flex().gap(px(10.0)).children(wallpapers))
-            .child(caption("accent color"))
             .child(
                 div()
                     .w_full()
+                    .max_w(px(560.0))
+                    .mx_auto()
                     .flex()
-                    .flex_wrap()
-                    .gap(px(6.0))
-                    .children(swatches),
+                    .flex_col()
+                    .pb(px(28.0))
+                    .child(pivot_header("Settings".into(), "Theme".into()))
+                    .child(caption("Theme"))
+                    .child(div().flex().gap(px(24.0)).children(themes))
+                    .child(caption("Wallpaper"))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(10.0))
+                            .children(wallpapers),
+                    )
+                    .child(caption("Accent Color"))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(6.0))
+                            .children(swatches),
+                    )
+                    .child(caption("Tile Gap"))
+                    .child(gap)
+                    .child(caption("Tile Transparency"))
+                    .child(alpha)
+                    .child(reset),
             )
     }
 
@@ -1857,7 +2822,7 @@ impl Metro {
         div()
             .size_full()
             .px(px(MARGIN))
-            .child(pivot_header(a.name.to_uppercase(), a.name.to_lowercase()))
+            .child(pivot_header("App".into(), a.name.into()))
             .child(
                 div()
                     .mt(px(10.0))
@@ -1886,9 +2851,101 @@ impl Metro {
                     ),
             )
     }
+    fn page_element(&self, page: Page, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+        match page {
+            Page::Start => {
+                let (layout, rows) = self.pack();
+                self.start_page(&layout, rows, window, cx)
+                    .into_any_element()
+            }
+            Page::Apps => self.apps_page(cx).into_any_element(),
+            Page::Settings => self.settings_page(cx).into_any_element(),
+            Page::App(i) => self.app_page(i).into_any_element(),
+        }
+    }
+
+    /// The Windows Phone style page change: the outgoing page stays laid out at
+    /// full size inside a clip that shrinks from the right, so it reads as a page
+    /// being turned away to reveal the new one beneath. A soft crease shadow
+    /// trails the moving edge.
+    fn page_flip(
+        &self,
+        width: f32,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> Option<AnyElement> {
+        if !self.page_morph {
+            return None;
+        }
+        let prev = self.prev_page?;
+        let old_page = self.page_element(prev, window, cx);
+        let backdrop = if prev == Page::Start {
+            hsla(0.0, 0.0, 0.0, 0.0)
+        } else {
+            self.page_bg()
+        };
+        let crease = hsla(0.0, 0.0, 0.0, if self.dark { 0.55 } else { 0.28 });
+        let w = width.max(1.0);
+
+        Some(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .h_full()
+                .overflow_hidden()
+                .bg(backdrop)
+                // The outgoing page is decorative while it peels away.
+                .block_mouse_except_scroll()
+                // The old page keeps its full width; only the clip narrows.
+                .child(div().w(px(w)).h_full().child(old_page))
+                .child(
+                    div()
+                        .absolute()
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .w(px(24.0))
+                        .h_full()
+                        .bg(linear_gradient(
+                            90.0,
+                            linear_color_stop(hsla(0.0, 0.0, 0.0, 0.0), 0.0),
+                            linear_color_stop(crease, 1.0),
+                        )),
+                )
+                .with_animation(
+                    ("page-flip", self.nav),
+                    Animation::new(Duration::from_millis(420)).with_easing(ease_out_quint()),
+                    move |el, d| {
+                        let turn = (1.0 - d).powf(1.35);
+                        el.w(px(w * turn))
+                            .opacity((0.35 + 0.65 * (1.0 - d)).min(1.0))
+                    },
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Focus the All Apps search field the first frame the page is shown.
+    fn maybe_focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.page == Page::Apps {
+            if self.search_pending {
+                self.search_pending = false;
+                self.search_focus.focus(window, cx);
+            }
+        } else {
+            self.search_pending = false;
+        }
+    }
 }
 
 // ───────────────────────────── root ─────────────────────────────
+
+/// Final write on shutdown, so a change made inside the debounce window is kept.
+impl Drop for Metro {
+    fn drop(&mut self) {
+        save_config(&self.config());
+    }
+}
 
 impl Render for Metro {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -1904,34 +2961,20 @@ impl Render for Metro {
         self.relayout(width);
         let me = cx.entity();
 
-        let page: AnyElement = match self.page {
-            Page::Start => {
-                let (layout, rows) = self.pack();
-                self.start_page(&layout, rows, window, cx)
-                    .into_any_element()
-            }
-            Page::Apps => self.apps_page(cx).into_any_element(),
-            Page::Settings => self.settings_page(cx).into_any_element(),
-            Page::App(i) => self.app_page(i).into_any_element(),
-        };
+        self.maybe_focus_search(window, cx);
 
-        // Turnstile-lite: new pages slide in from the right while fading up.
+        let page = self.page_element(self.page, window, cx);
         let page_backdrop = if self.page == Page::Start {
             hsla(0.0, 0.0, 0.0, 0.0)
         } else {
             self.page_bg()
         };
-        let animated = div()
-            .size_full()
-            .bg(page_backdrop)
-            .child(page)
-            .with_animation(
-                ("page", self.nav),
-                Animation::new(Duration::from_millis(320)).with_easing(ease_out_quint()),
-                |el, d| el.left(px(36.0 * (1.0 - d))).opacity(d),
-            );
+        let animated = div().size_full().bg(page_backdrop).child(page);
+        let flip = self.page_flip(width, window, cx);
 
         let dim = (1.0 - self.brightness) * 0.6;
+        let status_bar = self.status_bar(cx);
+        let panel_layer = self.panel_layer(window, cx);
 
         div()
             .id("root")
@@ -1939,32 +2982,30 @@ impl Render for Metro {
             .size_full()
             .text_color(self.fg())
             .font_family("Segoe UI")
-            // Swipe down anywhere on the status bar to open the control panel.
-            .on_mouse_down(
-                MouseButton::Left,
-                cx.listener(|this, e: &MouseDownEvent, _, _| {
-                    if !this.panel_open && f32::from(e.position.y) <= 28.0 {
-                        this.pull_start = Some(f32::from(e.position.y));
-                    }
-                }),
-            )
+            // A drag that starts on the status bar and travels down opens a panel;
+            // the half of the bar it started on picks which one.
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
-                if this.bright_drag {
-                    this.set_brightness_from_x(f32::from(e.position.x));
+                if let Some(drag) = this.drag {
+                    this.apply_drag(drag, f32::from(e.position.x));
                     cx.notify();
-                } else if let Some(start) = this.pull_start
+                } else if let Some((x, y)) = this.pull_start
                     && e.dragging()
-                    && f32::from(e.position.y) - start > 22.0
+                    && f32::from(e.position.y) - y > 22.0
                 {
                     this.pull_start = None;
-                    this.open_panel(cx);
+                    let kind = this.panel_for_x(x);
+                    this.open_panel(kind, cx);
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                cx.listener(|this, _: &MouseUpEvent, _, cx| {
                     this.pull_start = None;
-                    this.bright_drag = false;
+                    if this.drag.take().is_some() {
+                        // Brightness / gap / transparency were being scrubbed.
+                        this.save_soon(cx);
+                        cx.notify();
+                    }
                 }),
             )
             .child(self.wallpaper_view())
@@ -1973,7 +3014,8 @@ impl Render for Metro {
                     .size_full()
                     .flex()
                     .flex_col()
-                    .child(self.status_bar(cx))
+                    // The status bar is an overlay; this reserves its height in flow.
+                    .child(div().h(px(STATUS_H)))
                     .child(
                         div()
                             .flex_1()
@@ -1998,11 +3040,13 @@ impl Render for Metro {
                                 .absolute()
                                 .size_full(),
                             )
-                            .child(animated),
+                            .child(animated)
+                            // Book-page turn: the outgoing page is clipped away to the left.
+                            .when_some(flip, |d, f| d.child(f)),
                     )
                     .child(self.nav_bar(cx)),
             )
-            // Screen brightness: dim everything below the control panel.
+            // Screen brightness: dim everything below the panels.
             .when(dim > 0.001, |d| {
                 d.child(
                     div()
@@ -2013,7 +3057,29 @@ impl Render for Metro {
                         .bg(hsla(0.0, 0.0, 0.0, dim)),
                 )
             })
-            .when(self.panel_open, |d| d.child(self.control_panel(window, cx)))
+            // Sliding panel sits above the content but under the status bar.
+            .when_some(panel_layer, |d, layer| d.child(layer))
+            .child(status_bar)
+    }
+}
+
+/// Bounds for the main (host) window that lands on the user's desktop:
+/// `WINDOW_WIDTH` wide, full usable screen height, centred horizontally. The
+/// height excludes taskbar/dock areas, so the bottom of the UI stays reachable.
+fn main_window_bounds(cx: &App) -> Bounds<Pixels> {
+    let width = px(WINDOW_WIDTH);
+    match cx.primary_display() {
+        Some(display) => {
+            let screen = display.visible_bounds();
+            let x =
+                f32::from(screen.origin.x) + (f32::from(screen.size.width) - WINDOW_WIDTH) / 2.0;
+            Bounds {
+                origin: point(px(x), screen.origin.y),
+                size: size(width, screen.size.height),
+            }
+        }
+        // No display information (headless): fall back to a phone-proportioned window.
+        None => Bounds::centered(None, size(width, px(1064.0)), cx),
     }
 }
 
@@ -2021,7 +3087,7 @@ fn main() {
     application().with_assets(AppAssets).run(|cx| {
         init(cx);
 
-        let bounds = Bounds::centered(None, size(px(400.0), px(760.0)), cx);
+        let bounds = main_window_bounds(cx);
         open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
@@ -2037,4 +3103,117 @@ fn main() {
         )
         .expect("failed to open window");
     });
+}
+
+#[cfg(test)]
+mod tests {
+    // Deliberately not `use super::*`: the crate-root glob import of `gpui_kit`
+    // brings a `test` macro that would shadow Rust's built-in `#[test]`.
+    use super::{
+        CONFIG_VERSION, Config, GAP_MAX, TILE_ALPHA_MIN, TileSize, WALLPAPER_NAMES, app_index,
+        default_tiles, load_config, save_config,
+    };
+
+    #[test]
+    fn default_tiles_reference_real_apps() {
+        let tiles = default_tiles();
+        assert!(!tiles.is_empty());
+        for tile in &tiles {
+            assert!(
+                app_index(&tile.app).is_some(),
+                "{} is not in the app list",
+                tile.app
+            );
+        }
+    }
+
+    #[test]
+    fn config_round_trips_through_json() {
+        let mut config = Config::default();
+        config.dark = false;
+        config.accent = 0xE51400;
+        config.wallpaper = 3;
+        config.gap = 14.5;
+        config.tile_alpha = 0.75;
+        config.brightness = 0.6;
+        config.tiles[0].size = TileSize::Large;
+
+        let json = serde_json::to_string(&config).expect("serialise");
+        let parsed: Config = serde_json::from_str(&json).expect("parse");
+
+        assert_eq!(parsed.version, CONFIG_VERSION);
+        assert!(!parsed.dark);
+        assert_eq!(parsed.accent, 0xE51400);
+        assert_eq!(parsed.wallpaper, 3);
+        assert_eq!(parsed.gap, 14.5);
+        assert_eq!(parsed.tile_alpha, 0.75);
+        assert_eq!(parsed.brightness, 0.6);
+        assert_eq!(parsed.tiles.len(), config.tiles.len());
+        assert_eq!(parsed.tiles[0].app, config.tiles[0].app);
+        assert!(matches!(parsed.tiles[0].size, TileSize::Large));
+    }
+
+    #[test]
+    fn sanitize_drops_unknown_apps_and_clamps_values() {
+        let json = r#"{
+            "accent": 1193046,
+            "wallpaper": 99,
+            "gap": 500.0,
+            "tile_alpha": -1.0,
+            "brightness": 5.0,
+            "tiles": [
+                { "app": "Clock", "size": "large" },
+                { "app": "No Such App", "size": "small" }
+            ]
+        }"#;
+        let config: Config = serde_json::from_str(json).expect("parse");
+        let config = config.sanitized();
+
+        // Missing fields fall back to defaults.
+        assert!(config.dark);
+        assert_eq!(config.wallpaper, WALLPAPER_NAMES.len() - 1);
+        assert_eq!(config.gap, GAP_MAX);
+        assert_eq!(config.tile_alpha, TILE_ALPHA_MIN);
+        assert_eq!(config.brightness, 1.0);
+        // The bogus tile is dropped, the real one is kept.
+        assert_eq!(config.tiles.len(), 1);
+        assert_eq!(config.tiles[0].app, "Clock");
+    }
+
+    #[test]
+    fn save_then_load_round_trip() {
+        let path = std::env::temp_dir().join(format!(
+            "horn-config-test-{}-{}.json",
+            std::process::id(),
+            CONFIG_VERSION
+        ));
+        // SAFETY: this test owns the variable for its duration; nothing else reads it.
+        unsafe {
+            std::env::set_var("HORN_CONFIG", &path);
+        }
+
+        let mut config = Config::default();
+        config.accent = 0x008A00;
+        config.gap = 4.0;
+        config.wallpaper = 2;
+        config.tiles.retain(|tile| tile.app != "Games");
+
+        save_config(&config);
+        let loaded = load_config().expect("config should load back");
+
+        assert_eq!(loaded.accent, 0x008A00);
+        assert_eq!(loaded.gap, 4.0);
+        assert_eq!(loaded.wallpaper, 2);
+        assert!(!loaded.tiles.iter().any(|tile| tile.app == "Games"));
+
+        assert!(
+            path.exists(),
+            "config file should exist at {}",
+            path.display()
+        );
+        let _ = std::fs::remove_file(&path);
+        unsafe {
+            std::env::remove_var("HORN_CONFIG");
+        }
+    }
 }
