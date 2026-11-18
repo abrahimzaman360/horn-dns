@@ -1,4 +1,4 @@
-//! Windows Phone 8 "Metro" Start screen, built on GPUI Kit (https://gpui-kit.com).
+//! Windows 10 "Metro" Start screen, built on GPUI Kit (https://gpui-kit.com).
 //!
 //! Layout
 //!   • Tiles live on a grid of small cells. Small = 1×1, Medium = 2×2, Wide = 4×2, Large = 4×4.
@@ -7,17 +7,21 @@
 //!     and fonts / icons scale with the cell size.
 //!   • A first-fit packer flows tiles into the grid, so gaps are back-filled just like the
 //!     real Start screen. Tiles glide to their new place / size (GPUI Base `transition`).
+//!   • A selectable Metro wallpaper sits behind the tiles; tile ink flips between black and
+//!     white based on the accent luminance so every label stays readable.
 //!
 //! Interactions
 //!   • Live tiles flip on their own (staggered), clock ticks every second
 //!   • Press a tile -> it squishes, release opens the app
 //!   • Right-click a tile -> edit mode: ✕ unpins, ↔ cycles small → medium → wide → large
+//!   • Small tiles are icon-only: captions, badges and live info are hidden
 //!   • In edit mode, DRAG a tile onto another tile to take its place; everything re-packs.
 //!     Dropping on empty space sends it to the end.
 //!   • Arrow at the end of the tiles -> All Apps (right-click an app to pin/unpin)
-//!   • Settings tile -> light/dark theme + 20 classic Windows Phone accent colours
-//!   • Bottom bar: ← back (also leaves edit mode), ⊞ start, ⌕ apps
-
+//!   • Settings tile -> light/dark theme, wallpaper + 20 classic accent colours
+//!   • Swipe down (or click) the status bar -> control panel: quick toggles,
+//!     brightness, accent swatches, theme + All settings
+//!   • Bottom bar: ← back (also leaves edit mode / closes the panel), ⊞ start, ⌕ apps
 use gpui_kit::assets::{Assets as ComponentAssets, IconName, icon_assets};
 use gpui_kit::base::{Easing, Transition, transition};
 use gpui_kit::component::Icon;
@@ -53,7 +57,18 @@ icon_assets!(
         ArrowRight,
         ArrowLeftRight,
         Search,
-        X
+        X,
+        ChevronUp,
+        Wifi,
+        WifiOff,
+        Bluetooth,
+        BluetoothOff,
+        Plane,
+        Bell,
+        BellOff,
+        Moon,
+        Battery,
+        BatteryCharging
     ]
 );
 
@@ -88,6 +103,55 @@ const ACCENTS: [u32; 20] = [
 const MARGIN: f32 = 20.0; // left/right page margin
 const GAP: f32 = 10.0; // gap between tiles
 const TARGET_CELL: f32 = 78.0; // preferred small-cell size; actual size stretches to fill the width
+const PANEL_PAD: f32 = 20.0; // control-panel inner margin
+
+// Wallpaper presets: (top-left, bottom-right). Each theme gets its own set so the
+// foreground text stays readable without a heavy scrim.
+const WALLPAPERS_DARK: [(u32, u32); 3] = [
+    (0x0B1B2B, 0x123B4C), // Dusk
+    (0x0A0A0A, 0x262626), // Graphite
+    (0x170B29, 0x2C1A46), // Plum
+];
+const WALLPAPERS_LIGHT: [(u32, u32); 3] = [
+    (0xE7EEF5, 0xBBD6E6), // Dusk
+    (0xF2F2F2, 0xD6D6D6), // Graphite
+    (0xF2EAF7, 0xD7C6E8), // Plum
+];
+const WALLPAPER_NAMES: [&str; 3] = ["dusk", "graphite", "plum"];
+
+/// WCAG relative luminance for an 0xRRGGBB colour.
+fn relative_luminance(hex: u32) -> f32 {
+    fn channel(c: u32) -> f32 {
+        let c = c as f32 / 255.0;
+        if c <= 0.039_28 {
+            c / 12.92
+        } else {
+            ((c + 0.055) / 1.055).powf(2.4)
+        }
+    }
+    0.2126 * channel((hex >> 16) & 0xFF)
+        + 0.7152 * channel((hex >> 8) & 0xFF)
+        + 0.0722 * channel(hex & 0xFF)
+}
+
+/// Pick black or white text for a coloured surface, whichever has more contrast.
+/// Keeps the Metro look (solid accent tiles) while fixing unreadable white-on-lime.
+fn on_color(hex: u32) -> Hsla {
+    if relative_luminance(hex) > 0.18 {
+        black()
+    } else {
+        white()
+    }
+}
+
+/// The opposite ink, for controls drawn on top of `on_color`.
+fn inverse_ink(hex: u32) -> Hsla {
+    if relative_luminance(hex) > 0.18 {
+        white()
+    } else {
+        black()
+    }
+}
 
 struct AppDef {
     name: &'static str,
@@ -219,7 +283,11 @@ impl Render for DraggedTile {
             .flex()
             .items_center()
             .justify_center()
-            .child(glyph(self.icon.clone(), (self.h * 0.4).min(64.0), white()))
+            .child(glyph(
+                self.icon,
+                (self.h * 0.4).min(64.0),
+                on_color(self.color),
+            ))
     }
 }
 
@@ -245,6 +313,20 @@ struct Metro {
     scale: f32,
     last_w: f32,
     resizing: bool,
+    // control panel (swipe down from the status bar)
+    panel_open: bool,
+    panel_anim: usize,
+    pull_start: Option<f32>,
+    bright_drag: bool,
+    brightness: f32,
+    wifi: bool,
+    bluetooth: bool,
+    airplane: bool,
+    quiet: bool,
+    night_light: bool,
+    battery_saver: bool,
+    // wallpaper preset
+    wallpaper: usize,
 }
 
 impl Metro {
@@ -401,6 +483,18 @@ impl Metro {
             scale: 1.0,
             last_w: 0.0,
             resizing: false,
+            panel_open: true,
+            panel_anim: 1,
+            pull_start: None,
+            bright_drag: false,
+            brightness: 1.0,
+            wifi: true,
+            bluetooth: false,
+            airplane: false,
+            quiet: false,
+            night_light: false,
+            battery_saver: false,
+            wallpaper: 0,
         };
         me.stamp();
         me
@@ -544,7 +638,9 @@ impl Metro {
     }
 
     fn back(&mut self, cx: &mut Context<Self>) {
-        if self.edit.is_some() {
+        if self.panel_open {
+            self.panel_open = false;
+        } else if self.edit.is_some() {
             self.edit = None;
         } else if self.page != Page::Start {
             self.page = self.history.pop().unwrap_or(Page::Start);
@@ -574,13 +670,532 @@ impl Metro {
         cx.notify();
     }
 
+    // ── control panel ──
+
+    fn open_panel(&mut self, cx: &mut Context<Self>) {
+        if !self.panel_open {
+            self.panel_open = true;
+            self.panel_anim += 1;
+            self.edit = None;
+            cx.notify();
+        }
+    }
+
+    fn close_panel(&mut self, cx: &mut Context<Self>) {
+        if self.panel_open {
+            self.panel_open = false;
+            self.pull_start = None;
+            self.bright_drag = false;
+            cx.notify();
+        }
+    }
+
+    /// Map a pointer x-position onto the brightness track (sun icons + padding included).
+    fn set_brightness_from_x(&mut self, x: f32) {
+        // 15px left sun + 10px gap on the left, 21px right sun + 10px gap on the right.
+        let left = PANEL_PAD + 25.0;
+        let track = (self.measured_w - 2.0 * PANEL_PAD - 56.0).max(1.0);
+        self.brightness = ((x - left) / track).clamp(0.05, 1.0);
+    }
+
+    fn toggle_wifi(&mut self) {
+        self.wifi = !self.wifi;
+        if self.wifi {
+            self.airplane = false;
+        }
+    }
+
+    fn toggle_bluetooth(&mut self) {
+        self.bluetooth = !self.bluetooth;
+        if self.bluetooth {
+            self.airplane = false;
+        }
+    }
+
+    fn toggle_airplane(&mut self) {
+        self.airplane = !self.airplane;
+        if self.airplane {
+            self.wifi = false;
+            self.bluetooth = false;
+        }
+    }
+
+    fn quick_action(
+        &self,
+        id: &'static str,
+        name: &'static str,
+        icon: IconName,
+        active: bool,
+        toggle: fn(&mut Self),
+        cx: &mut Context<Self>,
+    ) -> Stateful<Div> {
+        let ink = if active {
+            on_color(self.accent)
+        } else {
+            self.fg()
+        };
+        let bg: Hsla = if active {
+            rgb(self.accent).into()
+        } else {
+            self.cell_bg()
+        };
+        div()
+            .id(id)
+            .flex_1()
+            .min_w_0()
+            .h(px(68.0))
+            .p(px(10.0))
+            .flex()
+            .flex_col()
+            .justify_between()
+            .items_start()
+            .bg(bg)
+            .rounded(px(2.0))
+            .cursor_pointer()
+            .active(|s| s.opacity(0.7))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                toggle(this);
+                cx.notify();
+            }))
+            .child(glyph(icon, 21.0, ink))
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .line_height(px(13.0))
+                    .text_color(ink)
+                    .child(name),
+            )
+    }
+
+    fn control_panel(&self, window: &mut Window, cx: &mut Context<Self>) -> Div {
+        let fg = self.fg();
+        let accent: Hsla = rgb(self.accent).into();
+        let viewport_h = f32::from(window.viewport_size().height);
+        let panel_h = (viewport_h * 0.64).clamp(360.0, 500.0);
+        let scrim_h = (viewport_h - panel_h).max(0.0);
+
+        let caption = |text: &'static str| {
+            div()
+                .mt(px(6.0))
+                .text_size(px(11.0))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(fg.opacity(0.55))
+                .child(text)
+        };
+
+        let close = div()
+            .id("panel-close")
+            .size(px(34.0))
+            .flex()
+            .items_center()
+            .justify_center()
+            .rounded_full()
+            .bg(self.cell_bg())
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx)))
+            .child(glyph(IconName::ChevronUp, 20.0, fg));
+
+        let header = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg.opacity(0.55))
+                            .child("ACTION CENTER"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(30.0))
+                            .line_height(px(34.0))
+                            .font_weight(FontWeight::LIGHT)
+                            .child("control panel"),
+                    ),
+            )
+            .child(close);
+
+        let row1 = div()
+            .flex()
+            .gap(px(8.0))
+            .child(self.quick_action(
+                "qa-wifi",
+                "Wi-Fi",
+                if self.wifi {
+                    IconName::Wifi
+                } else {
+                    IconName::WifiOff
+                },
+                self.wifi,
+                Self::toggle_wifi,
+                cx,
+            ))
+            .child(self.quick_action(
+                "qa-bt",
+                "Bluetooth",
+                if self.bluetooth {
+                    IconName::Bluetooth
+                } else {
+                    IconName::BluetoothOff
+                },
+                self.bluetooth,
+                Self::toggle_bluetooth,
+                cx,
+            ))
+            .child(self.quick_action(
+                "qa-plane",
+                "Airplane mode",
+                IconName::Plane,
+                self.airplane,
+                Self::toggle_airplane,
+                cx,
+            ));
+
+        let row2 = div()
+            .flex()
+            .gap(px(8.0))
+            .child(self.quick_action(
+                "qa-quiet",
+                "Quiet hours",
+                if self.quiet {
+                    IconName::BellOff
+                } else {
+                    IconName::Bell
+                },
+                self.quiet,
+                |this| this.quiet = !this.quiet,
+                cx,
+            ))
+            .child(self.quick_action(
+                "qa-night",
+                "Night light",
+                IconName::Moon,
+                self.night_light,
+                |this| this.night_light = !this.night_light,
+                cx,
+            ))
+            .child(self.quick_action(
+                "qa-battery",
+                "Battery saver",
+                if self.battery_saver {
+                    IconName::BatteryCharging
+                } else {
+                    IconName::Battery
+                },
+                self.battery_saver,
+                |this| this.battery_saver = !this.battery_saver,
+                cx,
+            ));
+
+        let brightness_head = div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(caption("BRIGHTNESS"))
+            .child(
+                div()
+                    .mt(px(6.0))
+                    .text_size(px(11.0))
+                    .text_color(fg.opacity(0.7))
+                    .child(format!("{}%", (self.brightness * 100.0).round() as u32)),
+            );
+
+        let brightness = div()
+            .flex()
+            .items_center()
+            .gap(px(10.0))
+            .child(glyph(IconName::Sun, 15.0, fg.opacity(0.55)))
+            .child(
+                div()
+                    .id("brightness-track")
+                    .relative()
+                    .flex_1()
+                    .h(px(26.0))
+                    .flex()
+                    .items_center()
+                    .cursor_pointer()
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                            this.bright_drag = true;
+                            this.set_brightness_from_x(f32::from(e.position.x));
+                            cx.notify();
+                        }),
+                    )
+                    .child(
+                        div()
+                            .relative()
+                            .w_full()
+                            .h(px(4.0))
+                            .bg(self.cell_bg())
+                            .child(
+                                div()
+                                    .absolute()
+                                    .left(px(0.0))
+                                    .top(px(0.0))
+                                    .h_full()
+                                    .w(relative(self.brightness))
+                                    .bg(accent),
+                            ),
+                    ),
+            )
+            .child(glyph(IconName::Sun, 21.0, fg.opacity(0.9)));
+
+        let swatches: Vec<Stateful<Div>> = ACCENTS
+            .iter()
+            .take(10)
+            .enumerate()
+            .map(|(i, &c)| {
+                div()
+                    .id(("panel-accent", i))
+                    .size(px(26.0))
+                    .rounded(px(2.0))
+                    .bg(rgb(c))
+                    .cursor_pointer()
+                    .active(|s| s.opacity(0.6))
+                    .when(self.accent == c, |d| d.border_2().border_color(fg))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.accent = c;
+                        cx.notify();
+                    }))
+            })
+            .collect();
+
+        let panel_button = |id: &'static str, icon: IconName, text: &'static str| {
+            div()
+                .id(id)
+                .flex_1()
+                .h(px(40.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .gap(px(8.0))
+                .bg(self.cell_bg())
+                .rounded(px(2.0))
+                .cursor_pointer()
+                .active(|s| s.opacity(0.65))
+                .child(glyph(icon, 17.0, fg))
+                .child(div().text_size(px(12.0)).text_color(fg).child(text))
+        };
+
+        let theme_btn = panel_button(
+            "panel-theme",
+            if self.dark {
+                IconName::Sun
+            } else {
+                IconName::Moon
+            },
+            if self.dark { "light mode" } else { "dark mode" },
+        )
+        .on_click(cx.listener(|this, _, _, cx| {
+            this.dark = !this.dark;
+            cx.notify();
+        }));
+
+        let settings_btn = panel_button("panel-settings", IconName::Settings, "all settings")
+            .on_click(cx.listener(|this, _, _, cx| {
+                this.panel_open = false;
+                this.go(Page::Settings, cx);
+                cx.notify();
+            }));
+
+        let scrim = div()
+            .id("panel-scrim")
+            .absolute()
+            .left(px(0.0))
+            .top(px(panel_h))
+            .w_full()
+            .h(px(scrim_h))
+            .bg(hsla(0.0, 0.0, 0.0, if self.dark { 0.5 } else { 0.28 }))
+            .occlude()
+            .on_click(cx.listener(|this, _, _, cx| this.close_panel(cx)));
+
+        let panel = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .w_full()
+            .h(px(panel_h))
+            .bg(self.panel_bg())
+            .border_b_1()
+            .border_color(fg.opacity(0.12))
+            .shadow_lg()
+            .occlude()
+            // Brightness drag is tracked here because the occluding panel owns the
+            // pointer while it is open; the root underneath does not receive moves.
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                if this.bright_drag {
+                    this.set_brightness_from_x(f32::from(e.position.x));
+                    cx.notify();
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| this.bright_drag = false),
+            )
+            .child(
+                div()
+                    .id("panel-scroll")
+                    .size_full()
+                    .overflow_y_scroll()
+                    .px(px(PANEL_PAD))
+                    .pt(px(34.0))
+                    .pb(px(PANEL_PAD))
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(header)
+                    .child(caption("QUICK ACTIONS"))
+                    .child(row1)
+                    .child(row2)
+                    .child(brightness_head)
+                    .child(brightness)
+                    .child(caption("ACCENT"))
+                    .child(div().flex().flex_wrap().gap(px(6.0)).children(swatches))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .flex()
+                            .gap(px(8.0))
+                            .child(theme_btn)
+                            .child(settings_btn),
+                    ),
+            )
+            .with_animation(
+                ("panel-in", self.panel_anim),
+                Animation::new(Duration::from_millis(260)).with_easing(ease_out_quint()),
+                move |el, d| el.top(px(-panel_h * (1.0 - d))).opacity(d),
+            );
+
+        div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .child(scrim)
+            .child(panel)
+    }
+
+    // ── wallpaper ──
+
+    fn wallpaper_pair(&self, i: usize) -> (u32, u32) {
+        let list = if self.dark {
+            &WALLPAPERS_DARK
+        } else {
+            &WALLPAPERS_LIGHT
+        };
+        list[i.min(list.len() - 1)]
+    }
+
+    fn wallpaper_colors(&self) -> (u32, u32) {
+        self.wallpaper_pair(self.wallpaper)
+    }
+
+    fn wallpaper_view(&self) -> Div {
+        let (from, to) = self.wallpaper_colors();
+        let accent: Hsla = rgb(self.accent).into();
+        let line = self.fg().opacity(0.05);
+        let line_faint = self.fg().opacity(0.025);
+
+        div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .overflow_hidden()
+            .bg(linear_gradient(
+                135.0,
+                linear_color_stop(rgb(from), 0.0),
+                linear_color_stop(rgb(to), 1.0),
+            ))
+            .child(div().absolute().size_full().bg(linear_gradient(
+                135.0,
+                linear_color_stop(accent.opacity(0.0), 0.3),
+                linear_color_stop(accent.opacity(if self.dark { 0.22 } else { 0.16 }), 1.0),
+            )))
+            .child(
+                div()
+                    .absolute()
+                    .top(px(-150.0))
+                    .right(px(-120.0))
+                    .size(px(430.0))
+                    .rounded_full()
+                    .bg(accent)
+                    .opacity(if self.dark { 0.09 } else { 0.07 }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(-180.0))
+                    .left(px(-140.0))
+                    .size(px(380.0))
+                    .rounded_full()
+                    .bg(accent)
+                    .opacity(if self.dark { 0.06 } else { 0.05 }),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .bottom(px(30.0))
+                    .right(px(-70.0))
+                    .size(px(220.0))
+                    .rounded_full()
+                    .border_1()
+                    .border_color(self.fg().opacity(0.06)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(120.0))
+                    .left(px(-60.0))
+                    .w(px(560.0))
+                    .h(px(1.0))
+                    .bg(line),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(168.0))
+                    .left(px(-60.0))
+                    .w(px(560.0))
+                    .h(px(1.0))
+                    .bg(line_faint),
+            )
+    }
+
     // ── theme ──
 
     fn fg(&self) -> Hsla {
         if self.dark { white() } else { black() }
     }
-    fn bg(&self) -> Hsla {
-        if self.dark { black() } else { white() }
+    /// Opaque-ish backdrop for list / settings pages so text stays readable
+    /// while a hint of the wallpaper still shows through.
+    fn page_bg(&self) -> Hsla {
+        if self.dark {
+            hsla(0.0, 0.0, 0.06, 0.95)
+        } else {
+            hsla(0.0, 0.0, 1.0, 0.95)
+        }
+    }
+    fn panel_bg(&self) -> Hsla {
+        if self.dark {
+            hsla(0.0, 0.0, 0.10, 1.0)
+        } else {
+            hsla(0.0, 0.0, 0.97, 1.0)
+        }
+    }
+    fn cell_bg(&self) -> Hsla {
+        if self.dark {
+            hsla(0.0, 0.0, 0.18, 1.0)
+        } else {
+            hsla(0.0, 0.0, 0.88, 1.0)
+        }
     }
 }
 
@@ -619,9 +1234,10 @@ fn pivot_header(small: String, big: String) -> Div {
 }
 
 impl Metro {
-    fn status_bar(&self) -> impl IntoElement {
+    fn status_bar(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let fg = self.fg();
         div()
+            .id("status-bar")
             .h(px(26.0))
             .px(px(10.0))
             .flex()
@@ -629,12 +1245,26 @@ impl Metro {
             .justify_between()
             .text_size(px(12.0))
             .text_color(fg)
+            .bg(if self.dark {
+                hsla(0.0, 0.0, 0.0, 0.30)
+            } else {
+                hsla(0.0, 0.0, 1.0, 0.40)
+            })
+            .cursor_pointer()
+            .on_click(cx.listener(|this, _, _, cx| this.open_panel(cx)))
             .child(
                 div()
                     .flex()
                     .items_end()
                     .gap(px(2.0))
                     .children((0..4).map(|i| div().w(px(3.0)).h(px(4.0 + 3.0 * i as f32)).bg(fg))),
+            )
+            .child(
+                div()
+                    .w(px(44.0))
+                    .h(px(3.0))
+                    .rounded_full()
+                    .bg(fg.opacity(0.55)),
             )
             .child(
                 div()
@@ -703,7 +1333,7 @@ impl Metro {
 
     // ── tiles ──
 
-    fn face(&self, face: &Face, t: &Tile) -> Div {
+    fn face(&self, face: &Face, t: &Tile, ink: Hsla) -> Div {
         let app = &APPS[t.app];
         let s = self.scale;
         let small = t.size == TileSize::Small;
@@ -712,19 +1342,19 @@ impl Metro {
             .top(px(0.0))
             .left(px(0.0))
             .size_full()
-            .text_color(white());
+            .text_color(ink);
 
         match face {
             Face::Icon => {
                 let icon_px = match t.size {
-                    TileSize::Small => 30.0,
+                    TileSize::Small => 34.0,
                     TileSize::Medium | TileSize::Wide => 56.0,
                     TileSize::Large => 88.0,
                 } * s;
                 base.flex()
                     .items_center()
                     .justify_center()
-                    .child(glyph(app.icon.clone(), icon_px, white()))
+                    .child(glyph(app.icon, icon_px, ink))
                     .when(!small, |d| d.child(label(app.name, s)))
                     .when_some(t.badge.filter(|_| !small), |d, n| {
                         d.child(
@@ -752,7 +1382,7 @@ impl Metro {
                 .child(
                     div()
                         .text_size(px(13.0 * s))
-                        .text_color(white().opacity(0.85))
+                        .text_color(ink.opacity(0.82))
                         .child(*body),
                 )
                 .child(label(app.name, s)),
@@ -774,6 +1404,8 @@ impl Metro {
                     TileSize::Wide => (8, 4, 2),
                     TileSize::Large => (16, 4, 4),
                 };
+                // The caption sits over the bottom-left block; use that block's ink.
+                let caption_ink = on_color(cols[((r - 1) * c) % 4]);
                 base.flex()
                     .flex_wrap()
                     .children((0..n).map(|i| {
@@ -782,7 +1414,7 @@ impl Metro {
                             .h(relative(1.0 / r as f32))
                             .bg(rgb(cols[i % 4]))
                     }))
-                    .child(label(app.name, s))
+                    .child(label(app.name, s).text_color(caption_ink))
             }
             Face::Clock => base
                 .flex()
@@ -803,14 +1435,22 @@ impl Metro {
     /// Front face, or (old face sliding up + new face sliding in from below).
     /// The wrapper ID includes `t.tick`, so every flip replays a fresh one-shot animation.
     fn tile_content(&self, t: &Tile, h: f32) -> AnyElement {
+        let hex = APPS[t.app].color.unwrap_or(self.accent);
+        let ink = on_color(hex);
+
+        // Small tiles are icon-only: no captions, badges or live info.
+        if t.size == TileSize::Small {
+            return self.face(&Face::Icon, t, ink).into_any_element();
+        }
+
         if t.faces.len() > 1 && t.tick > 0 {
             let anim = || Animation::new(Duration::from_millis(650)).with_easing(ease_out_quint());
-            let out = self.face(&t.faces[t.prev], t).with_animation(
+            let out = self.face(&t.faces[t.prev], t, ink).with_animation(
                 ("face-out", t.tick),
                 anim(),
                 move |el, d| el.top(px(-h * d)),
             );
-            let inn = self.face(&t.faces[t.idx], t).with_animation(
+            let inn = self.face(&t.faces[t.idx], t, ink).with_animation(
                 ("face-in", t.tick),
                 anim(),
                 move |el, d| el.top(px(h * (1.0 - d))),
@@ -822,7 +1462,7 @@ impl Metro {
                 .child(inn)
                 .into_any_element()
         } else {
-            self.face(&t.faces[t.idx], t).into_any_element()
+            self.face(&t.faces[t.idx], t, ink).into_any_element()
         }
     }
 
@@ -852,13 +1492,15 @@ impl Metro {
         let editing = self.edit == Some(id);
         let color_hex = APPS[t.app].color.unwrap_or(self.accent);
         let color = rgb(color_hex);
+        let ink = on_color(color_hex);
+        let inverse = inverse_ink(color_hex);
         let content = self.tile_content(t, h);
         let payload = DraggedTile {
             id,
             w,
             h,
             color: color_hex,
-            icon: APPS[t.app].icon.clone(),
+            icon: APPS[t.app].icon,
         };
 
         let circle_btn = |bid: &'static str, icon: IconName| {
@@ -870,8 +1512,8 @@ impl Metro {
                 .items_center()
                 .justify_center()
                 .rounded_full()
-                .bg(white())
-                .child(glyph(icon, 14.0, black()))
+                .bg(ink)
+                .child(glyph(icon, 14.0, inverse))
         };
 
         div()
@@ -928,7 +1570,7 @@ impl Metro {
                     .size_full()
                     .overflow_hidden()
                     .bg(color)
-                    .when(editing, |d| d.border_2().border_color(white()))
+                    .when(editing, |d| d.border_2().border_color(ink))
                     .child(content)
                     .when(editing, |d| {
                         d.child(
@@ -1026,7 +1668,7 @@ impl Metro {
     }
 
     fn apps_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
-        let accent = rgb(self.accent);
+        let fg = self.fg();
         let mut order: Vec<usize> = (0..APPS.len()).collect();
         order.sort_by_key(|&i| APPS[i].name);
 
@@ -1034,6 +1676,7 @@ impl Metro {
             .into_iter()
             .map(|i| {
                 let a = &APPS[i];
+                let app_hex = a.color.unwrap_or(self.accent);
                 let pinned = self.tiles.iter().any(|t| t.app == i);
                 div()
                     .id(("app-row", i))
@@ -1061,11 +1704,11 @@ impl Metro {
                         div()
                             .size(px(46.0))
                             .rounded_full()
-                            .bg(rgb(a.color.unwrap_or(self.accent)))
+                            .bg(rgb(app_hex))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(glyph(a.icon.clone(), 22.0, white())),
+                            .child(glyph(a.icon, 22.0, on_color(app_hex))),
                     )
                     .child(
                         div()
@@ -1075,7 +1718,19 @@ impl Metro {
                             .child(a.name),
                     )
                     .when(pinned, |d| {
-                        d.child(div().text_size(px(12.0)).text_color(accent).child("pinned"))
+                        d.child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(div().size(px(6.0)).rounded_full().bg(fg.opacity(0.55)))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0))
+                                        .text_color(fg.opacity(0.65))
+                                        .child("pinned"),
+                                ),
+                        )
                     })
             })
             .collect();
@@ -1094,26 +1749,57 @@ impl Metro {
 
     fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let fg = self.fg();
-        let accent = rgb(self.accent);
 
         let themes: Vec<_> = [("dark", true), ("light", false)]
             .into_iter()
             .map(|(name, dark)| {
+                let selected = self.dark == dark;
                 div()
                     .id(name)
                     .text_size(px(34.0))
                     .font_weight(FontWeight::LIGHT)
                     .cursor_pointer()
-                    .text_color(if self.dark == dark {
-                        accent.into()
-                    } else {
-                        fg.opacity(0.5)
-                    })
+                    .text_color(if selected { fg } else { fg.opacity(0.45) })
+                    .when(selected, |d| d.border_b_3().border_color(fg))
                     .child(name)
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.dark = dark;
                         cx.notify();
                     }))
+            })
+            .collect();
+
+        let wallpapers: Vec<_> = (0..WALLPAPER_NAMES.len())
+            .map(|i| {
+                let (from, to) = self.wallpaper_pair(i);
+                let selected = self.wallpaper == i;
+                div()
+                    .id(("wallpaper", i))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.wallpaper = i;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(92.0))
+                            .h(px(58.0))
+                            .bg(linear_gradient(
+                                135.0,
+                                linear_color_stop(rgb(from), 0.0),
+                                linear_color_stop(rgb(to), 1.0),
+                            ))
+                            .when(selected, |d| d.border_2().border_color(fg)),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .text_color(if selected { fg } else { fg.opacity(0.55) })
+                            .child(WALLPAPER_NAMES[i]),
+                    )
             })
             .collect();
 
@@ -1150,8 +1836,10 @@ impl Metro {
             .overflow_y_scroll()
             .px(px(MARGIN))
             .child(pivot_header("SETTINGS".into(), "theme".into()))
-            .child(caption("background"))
+            .child(caption("theme"))
             .child(div().flex().gap(px(24.0)).children(themes))
+            .child(caption("wallpaper"))
+            .child(div().flex().gap(px(10.0)).children(wallpapers))
             .child(caption("accent color"))
             .child(
                 div()
@@ -1165,6 +1853,7 @@ impl Metro {
 
     fn app_page(&self, i: usize) -> impl IntoElement {
         let a = &APPS[i];
+        let app_hex = a.color.unwrap_or(self.accent);
         div()
             .size_full()
             .px(px(MARGIN))
@@ -1179,11 +1868,11 @@ impl Metro {
                         div()
                             .size(px(120.0))
                             .rounded_full()
-                            .bg(rgb(a.color.unwrap_or(self.accent)))
+                            .bg(rgb(app_hex))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(glyph(a.icon.clone(), 60.0, white())),
+                            .child(glyph(a.icon, 60.0, on_color(app_hex))),
                     )
                     .child(
                         div()
@@ -1227,47 +1916,104 @@ impl Render for Metro {
         };
 
         // Turnstile-lite: new pages slide in from the right while fading up.
-        let animated = div().size_full().child(page).with_animation(
-            ("page", self.nav),
-            Animation::new(Duration::from_millis(320)).with_easing(ease_out_quint()),
-            |el, d| el.left(px(36.0 * (1.0 - d))).opacity(d),
-        );
+        let page_backdrop = if self.page == Page::Start {
+            hsla(0.0, 0.0, 0.0, 0.0)
+        } else {
+            self.page_bg()
+        };
+        let animated = div()
+            .size_full()
+            .bg(page_backdrop)
+            .child(page)
+            .with_animation(
+                ("page", self.nav),
+                Animation::new(Duration::from_millis(320)).with_easing(ease_out_quint()),
+                |el, d| el.left(px(36.0 * (1.0 - d))).opacity(d),
+            );
+
+        let dim = (1.0 - self.brightness) * 0.6;
 
         div()
+            .id("root")
+            .relative()
             .size_full()
-            .flex()
-            .flex_col()
-            .bg(self.bg())
             .text_color(self.fg())
             .font_family("Segoe UI")
-            .child(self.status_bar())
+            // Swipe down anywhere on the status bar to open the control panel.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _, _| {
+                    if !this.panel_open && f32::from(e.position.y) <= 28.0 {
+                        this.pull_start = Some(f32::from(e.position.y));
+                    }
+                }),
+            )
+            .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                if this.bright_drag {
+                    this.set_brightness_from_x(f32::from(e.position.x));
+                    cx.notify();
+                } else if let Some(start) = this.pull_start
+                    && e.dragging()
+                    && f32::from(e.position.y) - start > 22.0
+                {
+                    this.pull_start = None;
+                    this.open_panel(cx);
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|this, _: &MouseUpEvent, _, _| {
+                    this.pull_start = None;
+                    this.bright_drag = false;
+                }),
+            )
+            .child(self.wallpaper_view())
             .child(
                 div()
-                    .flex_1()
-                    .min_h_0()
-                    .relative()
-                    .overflow_hidden()
-                    // Invisible probe: reports the real width of this area every frame and
-                    // asks for a re-render only when it actually changed (no feedback loop).
+                    .size_full()
+                    .flex()
+                    .flex_col()
+                    .child(self.status_bar(cx))
                     .child(
-                        canvas(
-                            move |bounds, _window, cx| {
-                                let w = f32::from(bounds.size.width);
-                                me.update(cx, |this, cx| {
-                                    if (this.measured_w - w).abs() > 0.5 {
-                                        this.measured_w = w;
-                                        cx.notify();
-                                    }
-                                });
-                            },
-                            |_, _, _, _| {},
-                        )
-                        .absolute()
-                        .size_full(),
+                        div()
+                            .flex_1()
+                            .min_h_0()
+                            .relative()
+                            .overflow_hidden()
+                            // Invisible probe: reports the real width of this area every frame and
+                            // asks for a re-render only when it actually changed (no feedback loop).
+                            .child(
+                                canvas(
+                                    move |bounds, _window, cx| {
+                                        let w = f32::from(bounds.size.width);
+                                        me.update(cx, |this, cx| {
+                                            if (this.measured_w - w).abs() > 0.5 {
+                                                this.measured_w = w;
+                                                cx.notify();
+                                            }
+                                        });
+                                    },
+                                    |_, _, _, _| {},
+                                )
+                                .absolute()
+                                .size_full(),
+                            )
+                            .child(animated),
                     )
-                    .child(animated),
+                    .child(self.nav_bar(cx)),
             )
-            .child(self.nav_bar(cx))
+            // Screen brightness: dim everything below the control panel.
+            .when(dim > 0.001, |d| {
+                d.child(
+                    div()
+                        .absolute()
+                        .left(px(0.0))
+                        .top(px(0.0))
+                        .size_full()
+                        .bg(hsla(0.0, 0.0, 0.0, dim)),
+                )
+            })
+            .when(self.panel_open, |d| d.child(self.control_panel(window, cx)))
     }
 }
 
