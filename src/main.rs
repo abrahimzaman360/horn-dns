@@ -61,7 +61,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 mod lock;
-use lock::{DEFAULT_PIN, LockState, hash_pin};
+use lock::{DEFAULT_PIN, LockState, default_pin_for_len, hash_pin};
 
 // ───────────────────────────── assets ─────────────────────────────
 
@@ -270,19 +270,20 @@ fn relative_luminance(hex: u32) -> f32 {
 /// Pick black or white text for a coloured surface, whichever has more contrast.
 /// Keeps the Metro look (solid accent tiles) while fixing unreadable white-on-lime.
 fn on_color(hex: u32) -> Hsla {
-    if relative_luminance(hex) > 0.18 {
-        black()
-    } else {
+    // Use white on dark and most saturated tiles. Only bright surfaces use dark ink.
+    if relative_luminance(hex) < 0.30 {
         white()
+    } else {
+        black()
     }
 }
 
 /// The opposite ink, for controls drawn on top of `on_color`.
 fn inverse_ink(hex: u32) -> Hsla {
-    if relative_luminance(hex) > 0.18 {
-        white()
-    } else {
+    if relative_luminance(hex) < 0.30 {
         black()
+    } else {
+        white()
     }
 }
 
@@ -455,6 +456,8 @@ struct Config {
     #[serde(default)]
     tile_borders: bool,
     #[serde(default)]
+    force_accent_live_tiles: bool,
+    #[serde(default)]
     app_sort: AppSort,
     #[serde(default = "default_pin_hash")]
     pin_hash: Option<String>,
@@ -600,7 +603,7 @@ fn default_faces(app: usize) -> Vec<Face> {
         ],
         Some("Photos") => vec![Mosaic([0x008A00, 0x1BA1E2, 0xF0A30A, 0xA20025]), Icon],
         Some("Music") => vec![
-            Icon,
+            Music,
             Text {
                 head: "Now playing",
                 body: "Neon Rain — Fishmind",
@@ -658,6 +661,7 @@ impl Default for Config {
             liquid_glass: false,
             auto_adjust_tiles: true,
             tile_borders: false,
+            force_accent_live_tiles: false,
             app_sort: AppSort::Category,
             pin_hash: default_pin_hash(),
             pin_len: 4,
@@ -806,6 +810,7 @@ enum Face {
     },
     Mosaic([u32; 4]),
     Clock,
+    Music,
 }
 
 struct Tile {
@@ -1025,6 +1030,7 @@ struct Metro {
     liquid_glass: bool,
     auto_adjust_tiles: bool,
     tile_borders: bool,
+    force_accent_live_tiles: bool,
     wifi: bool,
     bluetooth: bool,
     airplane: bool,
@@ -1063,6 +1069,8 @@ struct Metro {
     editing: bool,
     tile_hold: Option<TileHold>,
     hold_token: usize,
+    pin_delete_held: bool,
+    pin_delete_used: bool,
     tile_menu: Option<TileMenu>,
     suppress_click: Option<usize>,
     empty_hold: Option<(usize, f32, f32)>,
@@ -1166,6 +1174,7 @@ impl Metro {
             liquid_glass: config.liquid_glass,
             auto_adjust_tiles: config.auto_adjust_tiles,
             tile_borders: config.tile_borders,
+            force_accent_live_tiles: config.force_accent_live_tiles,
             wifi: true,
             bluetooth: false,
             airplane: false,
@@ -1201,6 +1210,8 @@ impl Metro {
             editing: false,
             tile_hold: None,
             hold_token: 0,
+            pin_delete_held: false,
+            pin_delete_used: false,
             tile_menu: None,
             suppress_click: None,
             empty_hold: None,
@@ -1218,7 +1229,7 @@ impl Metro {
     fn stamp(&mut self) {
         let now = jiff::ZonedDateTime::now();
         self.time = now.strftime("%-I:%M").to_string();
-        self.date = now.strftime("%A, %B %-d").to_string();
+        self.date = now.strftime("%A, %B %-d, %Y").to_string();
     }
 
     fn heartbeat(&mut self, cx: &mut Context<Self>) {
@@ -1306,33 +1317,17 @@ impl Metro {
     /// Manual tile positions are fractions of available horizontal travel and vertical grid rows.
     fn tile_layout(&self) -> (Vec<(f32, f32)>, usize) {
         let (packed, packed_rows) = self.pack();
-        if self.auto_adjust_tiles {
-            return (
-                packed
-                    .into_iter()
-                    .zip(self.tiles.iter())
-                    .map(|((col, row), tile)| {
-                        let max_col = self.cols.saturating_sub(tile.size.cells().0).max(1);
-                        (col as f32 / max_col as f32, row as f32)
-                    })
-                    .collect(),
-                packed_rows,
-            );
-        }
-
-        let mut positions = Vec::with_capacity(self.tiles.len());
-        let mut rows = 0usize;
-        for (tile, (col, row)) in self.tiles.iter().zip(packed) {
-            let x = tile.manual_x.unwrap_or_else(|| {
-                let max_col = self.cols.saturating_sub(tile.size.cells().0).max(1);
-                col as f32 / max_col as f32
-            });
-            let y = tile.manual_y.unwrap_or(row as f32);
-            let height = tile.size.cells().1 as f32;
-            rows = rows.max((y.ceil() as usize).saturating_add(height as usize));
-            positions.push((x, y));
-        }
-        (positions, rows)
+        (
+            packed
+                .into_iter()
+                .zip(self.tiles.iter())
+                .map(|((col, row), tile)| {
+                    let max_col = self.cols.saturating_sub(tile.size.cells().0).max(1);
+                    (col as f32 / max_col as f32, row as f32)
+                })
+                .collect(),
+            packed_rows,
+        )
     }
 
     fn seed_new_manual_position(&mut self, id: usize) {
@@ -1402,22 +1397,37 @@ impl Metro {
         let Some(ix) = self.tiles.iter().position(|tile| tile.id == id) else {
             return;
         };
-        let tile = &self.tiles[ix];
-        let (cw, ch) = tile.size.cells();
+        let (cw, _) = self.tiles[ix].size.cells();
         let cell_step = self.cell + self.gap;
-        let canvas_x = self.pointer.0 - TILE_MARGIN;
-        let canvas_y = self.pointer.1 - STATUS_H - 8.0 - f32::from(self.start_scroll.offset().y);
-        let max_x = (self.cols as f32 - cw as f32).max(0.0) * cell_step;
-        let x = (canvas_x / max_x.max(1.0)).clamp(0.0, 1.0);
-        let y = (canvas_y / cell_step)
-            .max(0.0)
-            .min(MAX_MANUAL_ROWS as f32 - ch as f32);
-        self.tiles[ix].manual_x = Some(x);
-        self.tiles[ix].manual_y = Some(y);
-        // Move the dropped tile to the end of the render list so it appears above
-        // overlapping tiles instead of being painted underneath them.
-        let moved = self.tiles.remove(ix);
-        self.tiles.push(moved);
+        let canvas_x = (self.pointer.0 - TILE_MARGIN).max(0.0);
+        let canvas_y =
+            (self.pointer.1 - STATUS_H - 8.0 - f32::from(self.start_scroll.offset().y)).max(0.0);
+        let col = ((canvas_x / cell_step).round() as usize).min(self.cols.saturating_sub(cw));
+        let row = (canvas_y / cell_step).round() as usize;
+
+        let target = self.tiles.remove(ix);
+        let packed = self.pack().0;
+        let mut nearest = 0usize;
+        let mut nearest_distance = usize::MAX;
+        for (index, &(c, r)) in packed.iter().enumerate() {
+            if index == ix {
+                continue;
+            }
+            let distance = c.abs_diff(col) + r.abs_diff(row);
+            if distance < nearest_distance {
+                nearest_distance = distance;
+                nearest = index.min(self.tiles.len());
+            }
+        }
+        nearest = nearest.min(self.tiles.len());
+        self.tiles.insert(nearest, target);
+
+        let packed = self.pack().0;
+        for (tile, (col, row)) in self.tiles.iter_mut().zip(packed) {
+            let max_col = self.cols.saturating_sub(tile.size.cells().0).max(1);
+            tile.manual_x = Some(col as f32 / max_col as f32);
+            tile.manual_y = Some(row as f32);
+        }
         self.edit = None;
         self.save_soon(cx);
         cx.notify();
@@ -1502,6 +1512,7 @@ impl Metro {
             liquid_glass: self.liquid_glass,
             auto_adjust_tiles: self.auto_adjust_tiles,
             tile_borders: self.tile_borders,
+            force_accent_live_tiles: self.force_accent_live_tiles,
             app_sort: self.app_sort,
             pin_hash: self.lock.pin_hash.map(|hash| format!("{hash:016x}")),
             pin_len: self.lock.pin_len,
@@ -1561,6 +1572,7 @@ impl Metro {
         self.liquid_glass = defaults.liquid_glass;
         self.auto_adjust_tiles = defaults.auto_adjust_tiles;
         self.tile_borders = defaults.tile_borders;
+        self.force_accent_live_tiles = defaults.force_accent_live_tiles;
         self.app_sort = defaults.app_sort;
         self.app_sort_menu = false;
         self.lock.reset_defaults();
@@ -3003,6 +3015,9 @@ impl Metro {
     // ── tile size menu (long-press a tile, release without moving) ──
 
     fn tile_menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.editing && self.edit.is_none() {
+            return None;
+        }
         let menu = self.tile_menu?;
         let tile = self.tiles.iter().find(|t| t.id == menu.id)?;
         let app = &APPS[tile.app];
@@ -3986,14 +4001,18 @@ impl Metro {
             )
             .child(
                 div()
-                    .w(px(18.0))
-                    .h(px(18.0))
+                    .absolute()
+                    .left_0()
+                    .right_0()
+                    .mx_auto()
+                    .w(px(22.0))
+                    .h(px(22.0))
                     .flex()
                     .items_center()
                     .justify_center()
                     .child(
                         div()
-                            .size(px(10.0))
+                            .size(px(14.0))
                             .rounded_full()
                             .bg(hsla(0.0, 0.0, 0.02, 1.0))
                             .border_1()
@@ -4206,6 +4225,81 @@ impl Metro {
                     }))
                     .child(label(app.name, s).text_color(caption_ink))
             }
+            Face::Music => match t.size {
+                TileSize::Small | TileSize::Medium => base
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(glyph(app.icon, 56.0 * s, ink))
+                    .when(!small, |d| d.child(label(app.name, s))),
+                TileSize::Wide => base
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.0 * s))
+                    .child(glyph(app.icon, 44.0 * s, ink))
+                    .when(t.live_enabled, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .gap(px(2.0 * s))
+                                .child(
+                                    div()
+                                        .text_size(px(12.0 * s))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_ellipsis()
+                                        .child("Neon Rain"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.0 * s))
+                                        .text_color(ink)
+                                        .text_ellipsis()
+                                        .child("Fishmind"),
+                                ),
+                        )
+                    })
+                    .child(label(app.name, s)),
+                TileSize::Large => base
+                    .p(px(14.0 * s))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(10.0 * s))
+                    .when(t.live_enabled, |d| {
+                        d.child(div().flex().items_center().justify_between().child(glyph(
+                            app.icon,
+                            38.0 * s,
+                            ink,
+                        )))
+                    })
+                    .when(t.live_enabled, |d| {
+                        d.child(
+                            div()
+                                .flex()
+                                .flex_col()
+                                .items_center()
+                                .gap(px(4.0 * s))
+                                .child(
+                                    div()
+                                        .text_size(px(16.0 * s))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_ellipsis()
+                                        .child("Neon Rain"),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(12.0 * s))
+                                        .text_color(ink)
+                                        .text_ellipsis()
+                                        .child("Fishmind"),
+                                ),
+                        )
+                    })
+                    .child(label(app.name, s)),
+            },
             Face::Clock => {
                 // The clock owns a 2×2 tile; keep the type small enough that the
                 // time and the (long) date line can never spill past the window.
@@ -4229,9 +4323,10 @@ impl Metro {
                         div()
                             .w_full()
                             .mt(px(2.0 * s))
-                            .text_size(px((10.0 * s).min(13.0)))
+                            .text_size(px(((self.date.len().max(1) as f32 * -0.18 + 12.0) * s)
+                                .clamp(8.0, 13.0)))
                             .line_height(px((13.0 * s).min(16.0)))
-                            .text_color(ink.opacity(0.8))
+                            .text_color(ink)
                             .text_center()
                             .whitespace_nowrap()
                             .text_ellipsis()
@@ -4304,7 +4399,11 @@ impl Metro {
 
         let selected = self.edit == Some(id);
         let editing = self.editing || selected;
-        let color_hex = APPS[t.app].color.unwrap_or(self.accent);
+        let color_hex = if self.force_accent_live_tiles && t.live_enabled {
+            self.accent
+        } else {
+            APPS[t.app].color.unwrap_or(self.accent)
+        };
         let color = rgb(color_hex).opacity(if self.liquid_glass {
             self.tile_alpha
         } else {
@@ -4809,7 +4908,14 @@ impl Metro {
             .flex()
             .items_center()
             .justify_between()
-            .child(div().size(px(0.0)))
+            .child(
+                div()
+                    .text_size(px(54.0))
+                    .line_height(px(60.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .text_color(fg)
+                    .child("Apps"),
+            )
             .child(
                 div()
                     .id("apps-sort-menu")
@@ -4901,6 +5007,7 @@ impl Metro {
                     })
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.lock.pin_len = len;
+                        this.lock.pin_hash = Some(hash_pin(default_pin_for_len(len)));
                         this.lock.entry.clear();
                         this.save_soon(cx);
                         cx.notify();
@@ -5062,7 +5169,7 @@ impl Metro {
                     .border_1()
                     .border_color(pin_fg.opacity(0.34))
                     .cursor_pointer()
-                    .active(|s| s.opacity(0.55))
+                    .active(|s| s.opacity(0.55).bg(pin_fg.opacity(0.16)))
                     .on_click(cx.listener(move |this, _, _, cx| {
                         if let Some(ch) = digit.chars().next() {
                             this.lock.add_digit(ch);
@@ -5083,6 +5190,25 @@ impl Metro {
             );
         }
 
+        let pin_background = match self
+            .lock
+            .wallpaper
+            .as_ref()
+            .or(self.wallpaper_file.as_ref())
+        {
+            Some(path) => div()
+                .absolute()
+                .size_full()
+                .bg(hsla(0.0, 0.0, 0.02, 1.0))
+                .child(img(path.clone()).object_fit(ObjectFit::Cover).size_full())
+                .into_any_element(),
+            None => div()
+                .absolute()
+                .size_full()
+                .bg(hsla(0.0, 0.0, 0.02, 1.0))
+                .into_any_element(),
+        };
+
         let pin_surface = div()
             .absolute()
             .left(px(0.0))
@@ -5095,6 +5221,7 @@ impl Metro {
             .justify_center()
             .pt(px(72.0))
             .pb(px(72.0))
+            .child(pin_background)
             .child(
                 div()
                     .text_size(px(64.0))
@@ -5144,7 +5271,7 @@ impl Metro {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .active(|s| s.opacity(0.55))
+                            .active(|s| s.opacity(0.55).bg(pin_fg.opacity(0.16)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.lock.back_to_overlay();
                                 cx.notify();
@@ -5162,7 +5289,7 @@ impl Metro {
                             .border_1()
                             .border_color(pin_fg.opacity(0.34))
                             .cursor_pointer()
-                            .active(|s| s.opacity(0.55))
+                            .active(|s| s.opacity(0.55).bg(pin_fg.opacity(0.16)))
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.lock.add_digit('0');
                                 if this.lock.entry.len() == this.lock.pin_len {
@@ -5187,9 +5314,43 @@ impl Metro {
                             .items_center()
                             .justify_center()
                             .cursor_pointer()
-                            .active(|s| s.opacity(0.55))
+                            .active(|s| s.opacity(0.55).bg(pin_fg.opacity(0.16)))
+                            .on_mouse_down(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pin_delete_held = true;
+                                    this.pin_delete_used = false;
+                                    let token = this.hold_token.wrapping_add(1);
+                                    this.hold_token = token;
+                                    cx.spawn(async move |this, cx| {
+                                        cx.background_executor()
+                                            .timer(Duration::from_millis(TILE_HOLD_MS))
+                                            .await;
+                                        let _ = this.update(cx, |this, cx| {
+                                            if !this.pin_delete_held || this.hold_token != token {
+                                                return;
+                                            }
+                                            this.lock.clear_entry();
+                                            this.pin_delete_used = true;
+                                            cx.notify();
+                                        });
+                                    })
+                                    .detach();
+                                }),
+                            )
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|this, _, _, cx| {
+                                    this.pin_delete_held = false;
+                                    cx.notify();
+                                }),
+                            )
                             .on_click(cx.listener(|this, _, _, cx| {
-                                this.lock.backspace();
+                                if this.pin_delete_used {
+                                    this.pin_delete_used = false;
+                                } else {
+                                    this.lock.backspace();
+                                }
                                 cx.notify();
                             }))
                             .child(glyph(IconName::X, 22.0, pin_fg)),
@@ -5805,6 +5966,44 @@ impl Metro {
                     .child(div().mx(px(3.0)).size(px(16.0)).rounded_full().bg(fg)),
             );
 
+        let force_accent = self.force_accent_live_tiles;
+        let force_accent_toggle = div()
+            .id("setting-force-accent-live")
+            .w_full()
+            .h(px(44.0))
+            .flex()
+            .items_center()
+            .justify_between()
+            .cursor_pointer()
+            .active(|s| s.opacity(0.6))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.force_accent_live_tiles = !this.force_accent_live_tiles;
+                this.save_soon(cx);
+                cx.notify();
+            }))
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .text_color(fg)
+                    .child("Force Accent Color"),
+            )
+            .child(
+                div()
+                    .w(px(38.0))
+                    .h(px(22.0))
+                    .rounded_full()
+                    .bg(if force_accent {
+                        rgb(self.accent).into()
+                    } else {
+                        self.cell_bg()
+                    })
+                    .flex()
+                    .items_center()
+                    .when(force_accent, |d| d.justify_end())
+                    .when(!force_accent, |d| d.justify_start())
+                    .child(div().mx(px(3.0)).size(px(16.0)).rounded_full().bg(fg)),
+            );
+
         let reset = div()
             .id("settings-reset")
             .mt(px(26.0))
@@ -5841,6 +6040,7 @@ impl Metro {
                     .child(pivot_header("Settings".into(), "Theme".into(), key))
                     .child(caption("Theme"))
                     .child(div().flex().gap(px(24.0)).children(themes))
+                    .child(force_accent_toggle)
                     .child(caption("Wallpapers"))
                     .child(
                         div()
@@ -6093,21 +6293,21 @@ impl Render for Metro {
                         .text_size(px(44.0))
                         .font_weight(FontWeight::LIGHT)
                         .text_color(white())
-                        .child("LUMEN OS.Y"),
-                )
-                .with_animation(
-                    ("lumen-boot-root", 1u32),
-                    Animation::new(Duration::from_millis(7000)).with_easing(ease_out_quint()),
-                    |el, d| {
-                        let opacity = if d < 0.16 {
-                            d / 0.16
-                        } else if d > 0.72 {
-                            ((1.0 - d) / 0.28).clamp(0.0, 1.0)
-                        } else {
-                            1.0
-                        };
-                        el.opacity(opacity)
-                    },
+                        .child("LUMEN OS.Y")
+                        .with_animation(
+                            ("lumen-boot-logo", 1u32),
+                            Animation::new(Duration::from_millis(7000))
+                                .with_easing(ease_out_quint()),
+                            |el, d| {
+                                let highlight = d.clamp(0.0, 1.0);
+                                el.opacity(1.0).text_color(hsla(
+                                    0.0,
+                                    0.0,
+                                    0.78 + highlight * 0.22,
+                                    1.0,
+                                ))
+                            },
+                        ),
                 )
                 .into_any_element();
         }
@@ -6356,22 +6556,21 @@ impl Render for Metro {
                                 .text_size(px(44.0))
                                 .font_weight(FontWeight::LIGHT)
                                 .text_color(white())
-                                .child("LUMEN OS.Y"),
-                        )
-                        .with_animation(
-                            ("lumen-boot", 1u32),
-                            Animation::new(Duration::from_millis(7000))
-                                .with_easing(ease_out_quint()),
-                            |el, d| {
-                                let opacity = if d < 0.16 {
-                                    d / 0.16
-                                } else if d > 0.72 {
-                                    ((1.0 - d) / 0.28).clamp(0.0, 1.0)
-                                } else {
-                                    1.0
-                                };
-                                el.opacity(opacity)
-                            },
+                                .child("LUMEN OS.Y")
+                                .with_animation(
+                                    ("lumen-boot", 1u32),
+                                    Animation::new(Duration::from_millis(7000))
+                                        .with_easing(ease_out_quint()),
+                                    |el, d| {
+                                        let highlight = d.clamp(0.0, 1.0);
+                                        el.opacity(1.0).text_color(hsla(
+                                            0.0,
+                                            0.0,
+                                            0.78 + highlight * 0.22,
+                                            1.0,
+                                        ))
+                                    },
+                                ),
                         ),
                 )
             })
@@ -6476,6 +6675,7 @@ mod tests {
             liquid_glass: true,
             auto_adjust_tiles: false,
             tile_borders: true,
+            force_accent_live_tiles: true,
             app_sort: AppSort::Alphabetical,
             ..Config::default()
         };
@@ -6497,6 +6697,7 @@ mod tests {
         assert!(parsed.liquid_glass);
         assert!(!parsed.auto_adjust_tiles);
         assert!(parsed.tile_borders);
+        assert!(parsed.force_accent_live_tiles);
         assert_eq!(parsed.app_sort, AppSort::Alphabetical);
         assert_eq!(parsed.tiles.len(), config.tiles.len());
         assert_eq!(parsed.tiles[0].app, config.tiles[0].app);

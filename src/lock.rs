@@ -1,6 +1,16 @@
 use std::path::PathBuf;
 
 pub const DEFAULT_PIN: &str = "1234";
+pub const DEFAULT_PIN_5: &str = "12345";
+pub const DEFAULT_PIN_6: &str = "123456";
+
+pub fn default_pin_for_len(len: usize) -> &'static str {
+    match len {
+        6 => DEFAULT_PIN_6,
+        5 => DEFAULT_PIN_5,
+        _ => DEFAULT_PIN,
+    }
+}
 
 pub fn hash_pin(pin: &str) -> u64 {
     let mut hash = 0xcbf29ce484222325u64;
@@ -41,7 +51,11 @@ impl LockState {
         lock_wallpaper: Option<&str>,
         resolve_wallpaper: impl Fn(&str) -> Option<PathBuf>,
     ) -> Self {
-        let pin_hash = pin_hash.and_then(|value| u64::from_str_radix(&value, 16).ok());
+        let pin_len = pin_len.clamp(4, 6);
+        let pin_hash = pin_hash
+            .and_then(|value| u64::from_str_radix(&value, 16).ok())
+            .filter(|_| pin_len == 4)
+            .or_else(|| Some(hash_pin(default_pin_for_len(pin_len))));
         let wallpaper = lock_wallpaper.and_then(resolve_wallpaper);
         Self {
             locked: pin_hash.is_some(),
@@ -115,7 +129,7 @@ impl LockState {
     }
 
     pub fn set_enabled(&mut self, enabled: bool) {
-        self.pin_hash = enabled.then(|| hash_pin(DEFAULT_PIN));
+        self.pin_hash = enabled.then(|| hash_pin(default_pin_for_len(self.pin_len)));
         self.locked = enabled;
         self.entry.clear();
         self.error = false;
@@ -136,6 +150,11 @@ impl LockState {
 
     pub fn backspace(&mut self) {
         self.entry.pop();
+        self.error = false;
+    }
+
+    pub fn clear_entry(&mut self) {
+        self.entry.clear();
         self.error = false;
     }
 
@@ -274,5 +293,18 @@ mod tests {
         }
         assert!(lock.verify());
         assert!(!lock.locked);
+    }
+
+    #[test]
+    fn five_and_six_digit_defaults_verify() {
+        for (len, pin) in [(5, DEFAULT_PIN_5), (6, DEFAULT_PIN_6)] {
+            let mut lock =
+                LockState::new(Some(format!("{:016x}", hash_pin(pin))), len, None, |_| None);
+            for digit in pin.chars() {
+                lock.add_digit(digit);
+            }
+            assert!(lock.verify(), "{len}-digit PIN should verify");
+            assert!(!lock.locked);
+        }
     }
 }
