@@ -12,8 +12,9 @@
 //!
 //! Interactions
 //!   • Live tiles flip on their own (staggered), clock ticks every second
-//!   • Press a tile -> it squishes, release opens the app with a book-page turn
-//!     (the outgoing page is peeled away, Windows Phone style)
+//!   • App launch: press a tile -> it squishes, release and the tile zooms to fill the page
+//!     while every other tile "turnstiles" away (staggered by distance from the tapped tile).
+//!     The app's content then slides in. Going back turns the tiles back in, row by row.
 //!   • Right-click a tile -> edit mode: ✕ unpins, ↔ cycles small → medium → wide → large
 //!   • Small tiles are icon-only: captions, badges and live info are hidden
 //!   • Long labels are clamped with an ellipsis, so tile text never spills out
@@ -21,12 +22,15 @@
 //!     Dropping on empty space sends it to the end.
 //!   • Arrow at the end of the tiles -> All Apps: category headings, a search field at
 //!     the top, rectangular icon borders (right-click an app to pin/unpin)
-//!   • Settings tile -> theme + wallpaper + accent, tile gap and tile transparency,
-//!     plus "Reset to Defaults"
-//!   • The status bar never hides: it is the always-on top layer. Swipe down on its
-//!     left half for notifications, on its right half for the system panel (quick
-//!     toggles, brightness, accent). Clicking outside slides it back up.
-//!   • Bottom bar: ← back (also leaves edit mode / closes the panel), ⊞ start, ⌕ apps
+//!   • Settings tile -> theme + wallpaper + accent, tile gap and tile transparency
+//!   • The status bar never hides: it is the always-on top layer. Pull down on its
+//!     left half for notifications, on its right half for the system panel. The panel
+//!     follows the pointer while you pull; release past ~30 % to keep it open, otherwise
+//!     it springs back. Quick actions / notifications fly in one after another.
+//!     Clicking outside slides it back up.
+//!   • Bottom bar: ← back (also leaves edit mode / closes the panel / closes the switcher),
+//!     ⊞ start, ⌕ apps.  LONG-PRESS ⊞ (hold ~0.45 s) -> running apps: cards fly in, tap a
+//!     card to resume it (it zooms to full screen), ✕ flicks it away.
 //!
 //! Persistence
 //!   • Tile order/sizes and every theme setting are saved as JSON and restored on
@@ -34,6 +38,9 @@
 //!   • Default path: `$XDG_CONFIG_HOME|~/.config/horn/config.json`, `%APPDATA%\horn\
 //!     config.json` on Windows, `~/Library/Application Support/horn/config.json` on
 //!     macOS. Set `HORN_CONFIG` to override it with an explicit file path.
+//!
+//! Window
+//!   • The host window opens 476 px wide at full usable screen height, centred.
 use gpui_kit::assets::{Assets as ComponentAssets, IconName, icon_assets};
 use gpui_kit::base::{Easing, Transition, transition};
 use gpui_kit::component::Icon;
@@ -42,7 +49,7 @@ use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
 use std::path::PathBuf;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 // ───────────────────────────── assets ─────────────────────────────
 
@@ -121,8 +128,17 @@ const GAP_MAX: f32 = 28.0;
 const TARGET_CELL: f32 = 78.0; // preferred small-cell size; actual size stretches to fill the width
 const PANEL_PAD: f32 = 20.0; // panel inner margin
 const STATUS_H: f32 = 26.0; // status bar height (always the top layer)
+const NAV_H: f32 = 52.0; // bottom navigation bar height
 const TILE_ALPHA_MIN: f32 = 0.30; // most transparent a tile may get
 const WINDOW_WIDTH: f32 = 476.0; // main (host) window width; height fills the screen
+
+// Motion constants (ms)
+const LAUNCH_MS: u64 = 640; // whole launch splash (zoom + fade)
+const LAUNCH_SWAP_MS: u64 = 280; // moment the app page is swapped in (zoom finished)
+const HOME_HOLD_MS: u64 = 450; // long-press threshold on the Start button
+const ENTER_WINDOW_MS: u128 = 950; // tiles keep their turnstile-in wrapper for this long
+const PULL_COMMIT: f32 = 0.30; // fraction of the panel that must be pulled to keep it open
+const MAX_RUNNING: usize = 8;
 
 // Wallpaper presets: (top-left, bottom-right). Each theme gets its own set so the
 // foreground text stays readable without a heavy scrim.
@@ -141,6 +157,27 @@ const WALLPAPERS_LIGHT: [(u32, u32); 5] = [
     (0xFCEFE4, 0xF2CDB4), // Ember
 ];
 const WALLPAPER_NAMES: [&str; 5] = ["Dusk", "Graphite", "Plum", "Ocean", "Ember"];
+
+// ───────────────────────────── motion helpers ─────────────────────────────
+
+fn lerp(a: f32, b: f32, t: f32) -> f32 {
+    a + (b - a) * t
+}
+
+/// Quartic ease-out, input clamped to 0..=1.
+fn ease_out(t: f32) -> f32 {
+    1.0 - (1.0 - t.clamp(0.0, 1.0)).powi(4)
+}
+
+/// Cubic ease-in-out, input clamped to 0..=1.
+fn ease_in_out(t: f32) -> f32 {
+    let t = t.clamp(0.0, 1.0);
+    if t < 0.5 {
+        4.0 * t * t * t
+    } else {
+        1.0 - (-2.0 * t + 2.0).powi(3) / 2.0
+    }
+}
 
 /// WCAG relative luminance for an 0xRRGGBB colour.
 fn relative_luminance(hex: u32) -> f32 {
@@ -590,7 +627,6 @@ fn tiles_from_config(configs: &[TileConfig]) -> Vec<Tile> {
         })
         .collect()
 }
-
 #[derive(Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum TileSize {
@@ -671,6 +707,24 @@ enum Page {
     App(usize),
 }
 
+/// The page that shows a given app.
+fn page_for(app: usize) -> Page {
+    if app == SETTINGS {
+        Page::Settings
+    } else {
+        Page::App(app)
+    }
+}
+
+/// The app a page belongs to (None for Start / All Apps).
+fn app_of(page: Page) -> Option<usize> {
+    match page {
+        Page::App(i) => Some(i),
+        Page::Settings => Some(SETTINGS),
+        _ => None,
+    }
+}
+
 /// Which surface slides down from the status bar.
 #[derive(Clone, Copy, PartialEq)]
 enum PanelKind {
@@ -696,6 +750,39 @@ struct Slider {
     max: &'static str,
     value: String,
     ratio: f32,
+}
+
+/// How a tile takes part in a page transition.
+#[derive(Clone, Copy)]
+enum Turn {
+    Idle,
+    /// Turn in (payload = animation key, so it replays per navigation).
+    Enter(usize),
+    /// Turn away because another tile is being launched (payload = launch number).
+    Leave(usize),
+}
+
+/// A running app launch: a coloured plate grows from `rect` to the full page area.
+#[derive(Clone, Copy)]
+struct Launch {
+    app: usize,
+    /// Tile that was tapped (it stays put under the plate while the rest turnstile away).
+    tile: Option<usize>,
+    /// Grid cell of the tapped tile, used to stagger the others by distance.
+    from: (usize, usize),
+    /// Start rectangle in root coordinates: (x, y, w, h).
+    rect: (f32, f32, f32, f32),
+    n: usize,
+}
+
+/// Geometry of the running-apps card grid.
+#[derive(Clone, Copy)]
+struct SwGeo {
+    cols: usize,
+    cw: f32,
+    ch: f32,
+    gap: f32,
+    top: f32,
 }
 
 /// Payload carried while a tile is being dragged. Also renders the drag "ghost".
@@ -738,6 +825,7 @@ struct Metro {
     page_morph: bool,
     history: Vec<Page>,
     nav: usize,          // bumps on every navigation so the page-in animation replays
+    nav_at: Instant,     // when the last navigation happened
     edit: Option<usize>, // id of the tile in edit mode
     drop_handled: bool,
     time: String,
@@ -745,16 +833,25 @@ struct Metro {
     secs: u64,
     // responsive layout, recomputed every frame from the *measured* content width
     measured_w: f32, // real laid-out width of the page area (0 until first measurement)
+    measured_h: f32, // real laid-out height of the page area
+    vh: f32,         // window viewport height (last frame)
     cols: usize,
     cell: f32,
     scale: f32,
     last_w: f32,
     resizing: bool,
+    start_scroll: ScrollHandle,
+    // app launch zoom
+    launch: Option<Launch>,
+    launch_n: usize,
     // panels (swipe down from the status bar)
     panel: Option<PanelKind>,
     panel_closing: bool,
     panel_token: usize,
+    panel_open_n: usize, // bumps only when a panel opens, drives the staggered fly-in
     pull_start: Option<(f32, f32)>,
+    pulling: bool,
+    pull_y: f32,
     drag: Option<Drag>,
     brightness: f32,
     wifi: bool,
@@ -764,6 +861,18 @@ struct Metro {
     night_light: bool,
     battery_saver: bool,
     notes_cleared: bool,
+    // running apps / task switcher (long-press Start)
+    running: Vec<usize>, // most recent first
+    switcher: bool,
+    switcher_closing: bool,
+    switcher_token: usize,
+    switcher_n: usize,
+    switcher_scroll: ScrollHandle,
+    dismissing: Option<usize>,
+    dismiss_n: usize,
+    home_press: Option<usize>,
+    press_n: usize,
+    home_long: bool,
     // appearance
     wallpaper: usize,
     gap: f32,
@@ -804,21 +913,30 @@ impl Metro {
             page_morph: false,
             history: vec![],
             nav: 0,
+            nav_at: Instant::now(),
             edit: None,
             drop_handled: false,
             time: String::new(),
             date: String::new(),
             secs: 0,
             measured_w: 0.0,
+            measured_h: 0.0,
+            vh: 760.0,
             cols: 4,
             cell: TARGET_CELL,
             scale: 1.0,
             last_w: 0.0,
             resizing: false,
+            start_scroll: ScrollHandle::new(),
+            launch: None,
+            launch_n: 0,
             panel: None,
             panel_closing: false,
             panel_token: 0,
+            panel_open_n: 0,
             pull_start: None,
+            pulling: false,
+            pull_y: 0.0,
             drag: None,
             brightness: config.brightness,
             wifi: true,
@@ -828,6 +946,18 @@ impl Metro {
             night_light: false,
             battery_saver: false,
             notes_cleared: false,
+            // A few apps "already running" so the switcher has something to show.
+            running: vec![2, 8, 6],
+            switcher: false,
+            switcher_closing: false,
+            switcher_token: 0,
+            switcher_n: 0,
+            switcher_scroll: ScrollHandle::new(),
+            dismissing: None,
+            dismiss_n: 0,
+            home_press: None,
+            press_n: 0,
+            home_long: false,
             wallpaper: config.wallpaper,
             gap: config.gap,
             tile_alpha: config.tile_alpha,
@@ -880,6 +1010,15 @@ impl Metro {
         self.last_w = width;
     }
 
+    /// Height of the page area (between status bar and nav bar).
+    fn page_h(&self) -> f32 {
+        if self.measured_h > 0.0 {
+            self.measured_h
+        } else {
+            (self.vh - STATUS_H - NAV_H).max(100.0)
+        }
+    }
+
     /// First-fit packer: every tile goes to the first free spot (row-major),
     /// so smaller tiles back-fill holes. Returns (col, row) per tile and the row count.
     fn pack(&self) -> (Vec<(usize, usize)>, usize) {
@@ -921,8 +1060,31 @@ impl Metro {
         (out, rows)
     }
 
-    /// Animated value for one tile channel. While the window itself is being resized the
-    /// tween is effectively instant, so the grid tracks the window edge without lag.
+    /// Animated value for any keyed channel. While the window itself is being resized the
+    /// tween is effectively instant, so layouts track the window edge without lag.
+    #[allow(clippy::too_many_arguments)]
+    fn tween_in(
+        &self,
+        scope: &'static str,
+        id: usize,
+        key: &'static str,
+        target: f32,
+        ms: u64,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> f32 {
+        let eid: ElementId = (scope, id).into();
+        let ms = if self.resizing { 1 } else { ms };
+        transition(
+            (eid, key),
+            target,
+            Transition::new(Duration::from_millis(ms)).easing(Easing::EaseOut),
+            window,
+            cx,
+        )
+    }
+
+    /// Animated value for one tile channel.
     fn tween(
         &self,
         id: usize,
@@ -931,15 +1093,7 @@ impl Metro {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> f32 {
-        let eid: ElementId = ("tile-motion", id).into();
-        let ms = if self.resizing { 1 } else { 280 };
-        transition(
-            (eid, key),
-            target,
-            Transition::new(Duration::from_millis(ms)).easing(Easing::EaseOut),
-            window,
-            cx,
-        )
+        self.tween_in("tile-motion", id, key, target, 280, window, cx)
     }
 
     /// Drag-to-replace: the dragged tile takes the target's slot, the rest shift and re-pack.
@@ -1038,16 +1192,30 @@ impl Metro {
         self.flip_to(page, cx);
     }
 
+    /// Remember an app as "running" (most recent first).
+    fn note_running(&mut self, page: Page) {
+        if let Some(app) = app_of(page) {
+            self.running.retain(|&a| a != app);
+            self.running.insert(0, app);
+            self.running.truncate(MAX_RUNNING);
+        }
+    }
+
     /// Swap pages with the book-page (Windows Phone) reveal: the outgoing page is
     /// kept alive for the duration of the peel, then dropped.
     fn flip_to(&mut self, page: Page, cx: &mut Context<Self>) {
         self.prev_page = Some(self.page);
         self.page = page;
         self.nav += 1;
+        self.nav_at = Instant::now();
         self.edit = None;
         self.page_morph = true;
+        self.note_running(page);
         if page == Page::Apps {
             self.search_pending = true;
+        }
+        if self.switcher && !self.switcher_closing {
+            self.close_switcher(cx);
         }
         let token = self.nav;
         cx.spawn(async move |this, cx| {
@@ -1067,8 +1235,13 @@ impl Metro {
     }
 
     fn back(&mut self, cx: &mut Context<Self>) {
+        if self.launch.is_some() {
+            return;
+        }
         if self.panel.is_some() {
             self.close_panel(cx);
+        } else if self.switcher && !self.switcher_closing {
+            self.close_switcher(cx);
         } else if self.edit.is_some() {
             self.edit = None;
             cx.notify();
@@ -1081,7 +1254,13 @@ impl Metro {
     }
 
     fn home(&mut self, cx: &mut Context<Self>) {
+        if self.launch.is_some() {
+            return;
+        }
         self.history.clear();
+        if self.switcher && !self.switcher_closing {
+            self.close_switcher(cx);
+        }
         if self.page != Page::Start {
             self.flip_to(Page::Start, cx);
         } else {
@@ -1095,14 +1274,7 @@ impl Metro {
         self.panel = None;
         self.panel_closing = false;
         self.panel_token += 1;
-        self.go(
-            if app == SETTINGS {
-                Page::Settings
-            } else {
-                Page::App(app)
-            },
-            cx,
-        );
+        self.go(page_for(app), cx);
     }
 
     fn toggle_pin(&mut self, app: usize, cx: &mut Context<Self>) {
@@ -1124,12 +1296,249 @@ impl Metro {
         cx.notify();
     }
 
+    // ── app launch (zoom + turnstile) ──
+
+    /// Start the launch splash for a tapped Start tile.
+    fn launch_from_tile(&mut self, id: usize, cx: &mut Context<Self>) {
+        let (layout, _) = self.pack();
+        let Some(ix) = self.tiles.iter().position(|t| t.id == id) else {
+            return;
+        };
+        let t = &self.tiles[ix];
+        let (c, r) = layout[ix];
+        let (cw, ch) = t.size.cells();
+        let (cell, g) = (self.cell, self.gap);
+        let x = MARGIN + c as f32 * (cell + g);
+        let y = STATUS_H + 8.0 + r as f32 * (cell + g) + f32::from(self.start_scroll.offset().y);
+        let w = cw as f32 * cell + (cw as f32 - 1.0) * g;
+        let h = ch as f32 * cell + (ch as f32 - 1.0) * g;
+        let app = t.app;
+        self.begin_launch(
+            Launch {
+                app,
+                tile: Some(id),
+                from: (c, r),
+                rect: (x, y, w, h),
+                n: 0,
+            },
+            cx,
+        );
+    }
+
+    /// Start the launch splash from a card in the running-apps switcher.
+    fn launch_from_card(&mut self, app: usize, cx: &mut Context<Self>) {
+        let Some(i) = self.running.iter().position(|&a| a == app) else {
+            return;
+        };
+        if app_of(self.page) == Some(app) {
+            // Already the foreground app: just drop the switcher.
+            self.close_switcher(cx);
+            return;
+        }
+        let g = self.switcher_geo(self.last_w);
+        let (px_, py_) = Self::card_xy(i, g);
+        let y = STATUS_H + py_ + f32::from(self.switcher_scroll.offset().y);
+        self.begin_launch(
+            Launch {
+                app,
+                tile: None,
+                from: (0, 0),
+                rect: (px_, y, g.cw, g.ch),
+                n: 0,
+            },
+            cx,
+        );
+    }
+
+    /// Phase 1 (0 → LAUNCH_SWAP_MS): plate zooms to full page, other tiles turnstile away.
+    /// Phase 2: the app page is swapped in underneath, the plate fades out and the
+    /// app's own content slides in.
+    fn begin_launch(&mut self, mut l: Launch, cx: &mut Context<Self>) {
+        if self.launch.is_some() {
+            return;
+        }
+        self.launch_n += 1;
+        l.n = self.launch_n;
+        self.launch = Some(l);
+        self.edit = None;
+        let (n, app) = (l.n, l.app);
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(LAUNCH_SWAP_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.launch.map(|l| l.n) == Some(n) {
+                    this.commit_open(app, cx);
+                }
+            });
+            cx.background_executor()
+                .timer(Duration::from_millis(LAUNCH_MS - LAUNCH_SWAP_MS + 40))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.launch.map(|l| l.n) == Some(n) {
+                    this.launch = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Swap straight to the app page (no page peel — the launch plate covers the switch).
+    fn commit_open(&mut self, app: usize, cx: &mut Context<Self>) {
+        let page = page_for(app);
+        self.switcher = false;
+        self.switcher_closing = false;
+        self.switcher_token += 1;
+        self.panel = None;
+        self.panel_closing = false;
+        self.panel_token += 1;
+        self.pulling = false;
+        if self.page != page {
+            self.history.push(self.page);
+        }
+        self.page = page;
+        self.prev_page = None;
+        self.page_morph = false;
+        self.nav += 1;
+        self.nav_at = Instant::now();
+        self.edit = None;
+        self.note_running(page);
+        cx.notify();
+    }
+
+    // ── running apps switcher ──
+
+    fn open_switcher(&mut self, cx: &mut Context<Self>) {
+        if self.launch.is_some() {
+            return;
+        }
+        if self.switcher && !self.switcher_closing {
+            self.close_switcher(cx);
+            return;
+        }
+        self.switcher = true;
+        self.switcher_closing = false;
+        self.switcher_token += 1;
+        self.switcher_n += 1;
+        self.dismissing = None;
+        self.edit = None;
+        if self.panel.is_some() {
+            self.panel = None;
+            self.panel_closing = false;
+            self.panel_token += 1;
+        }
+        cx.notify();
+    }
+
+    fn close_switcher(&mut self, cx: &mut Context<Self>) {
+        if !self.switcher || self.switcher_closing {
+            return;
+        }
+        self.switcher_closing = true;
+        self.switcher_token += 1;
+        let token = self.switcher_token;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(260))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.switcher_token == token {
+                    this.switcher = false;
+                    this.switcher_closing = false;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Flick a card away; the remaining cards glide into the gap.
+    fn dismiss_app(&mut self, app: usize, cx: &mut Context<Self>) {
+        if self.dismissing.is_some() {
+            return;
+        }
+        self.dismissing = Some(app);
+        self.dismiss_n += 1;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(270))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                this.running.retain(|&a| a != app);
+                this.dismissing = None;
+                if app_of(this.page) == Some(app) {
+                    // The foreground app was closed: fall back to Start behind the switcher.
+                    this.page = Page::Start;
+                    this.prev_page = None;
+                    this.page_morph = false;
+                    this.history.clear();
+                    this.nav += 1;
+                    this.nav_at = Instant::now();
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Press on the Start button: a long press opens the switcher instead of going home.
+    fn home_down(&mut self, cx: &mut Context<Self>) {
+        self.press_n += 1;
+        let n = self.press_n;
+        self.home_press = Some(n);
+        self.home_long = false;
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(HOME_HOLD_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                if this.home_press == Some(n) {
+                    this.home_press = None;
+                    this.home_long = true;
+                    this.open_switcher(cx);
+                }
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    fn switcher_geo(&self, width: f32) -> SwGeo {
+        let gap = 12.0;
+        let avail = (width - 2.0 * MARGIN).max(160.0);
+        let cols = (((avail + gap) / (170.0 + gap)).floor() as usize).clamp(2, 6);
+        let cw = ((avail - gap * (cols as f32 - 1.0)) / cols as f32).floor();
+        SwGeo {
+            cols,
+            cw,
+            ch: (cw * 1.4).round(),
+            gap,
+            top: 64.0,
+        }
+    }
+
+    fn card_xy(i: usize, g: SwGeo) -> (f32, f32) {
+        (
+            MARGIN + (i % g.cols) as f32 * (g.cw + g.gap),
+            g.top + (i / g.cols) as f32 * (g.ch + g.gap),
+        )
+    }
+
     // ── panels ──
+
+    fn panel_height_for(viewport_h: f32) -> f32 {
+        (viewport_h * 0.66).clamp(320.0, 560.0)
+    }
 
     fn open_panel(&mut self, kind: PanelKind, cx: &mut Context<Self>) {
         self.panel = Some(kind);
         self.panel_closing = false;
         self.panel_token += 1;
+        self.panel_open_n += 1;
         self.edit = None;
         self.pull_start = None;
         cx.notify();
@@ -1143,6 +1552,7 @@ impl Metro {
         }
         self.panel_closing = true;
         self.pull_start = None;
+        self.pulling = false;
         self.drag = None;
         self.panel_token += 1;
         let token = self.panel_token;
@@ -1177,6 +1587,57 @@ impl Metro {
             self.close_panel(cx);
         } else {
             self.open_panel(kind, cx);
+        }
+    }
+
+    // ── pointer tracking (root + gesture catcher) ──
+
+    fn pointer_move(&mut self, e: &MouseMoveEvent, cx: &mut Context<Self>) {
+        if let Some(drag) = self.drag {
+            self.apply_drag(drag, f32::from(e.position.x));
+            cx.notify();
+        } else if let Some((x, y)) = self.pull_start
+            && e.dragging()
+        {
+            let dy = f32::from(e.position.y) - y;
+            if !self.pulling && self.panel.is_none() && dy > 6.0 {
+                // Mount the panel right away; it then tracks the pointer 1:1.
+                let kind = self.panel_for_x(x);
+                self.pulling = true;
+                self.panel = Some(kind);
+                self.panel_closing = false;
+                self.panel_token += 1;
+                self.panel_open_n += 1;
+                self.edit = None;
+            }
+            if self.pulling {
+                self.pull_y = dy.max(0.0);
+                cx.notify();
+            }
+        }
+    }
+
+    fn pointer_up(&mut self, cx: &mut Context<Self>) {
+        self.home_press = None;
+        let was_slider = self.drag.take().is_some();
+        if self.pulling {
+            // Release: keep the panel if it was pulled far enough, else spring it back.
+            self.pulling = false;
+            self.pull_start = None;
+            let ph = Self::panel_height_for(self.vh);
+            if self.pull_y > ph * PULL_COMMIT {
+                self.panel_closing = false;
+            } else {
+                self.close_panel(cx);
+            }
+            cx.notify();
+            return;
+        }
+        self.pull_start = None;
+        if was_slider {
+            // Brightness / gap / transparency were being scrubbed.
+            self.save_soon(cx);
+            cx.notify();
         }
     }
 
@@ -1227,6 +1688,8 @@ impl Metro {
         }
     }
 
+    /// One quick-action tile. `slot` (0..=5) staggers its fly-in when the panel opens.
+    #[allow(clippy::too_many_arguments)]
     fn quick_action(
         &self,
         id: &'static str,
@@ -1234,8 +1697,9 @@ impl Metro {
         icon: IconName,
         active: bool,
         toggle: fn(&mut Self),
+        slot: usize,
         cx: &mut Context<Self>,
-    ) -> Stateful<Div> {
+    ) -> AnyElement {
         let ink = if active {
             on_color(self.accent)
         } else {
@@ -1246,8 +1710,12 @@ impl Metro {
         } else {
             self.cell_bg()
         };
+        let open_n = self.panel_open_n;
+        let delay = 45.0 * slot as f32;
+        let total = 320.0 + 45.0 * 5.0;
         div()
             .id(id)
+            .relative()
             .flex_1()
             .min_w_0()
             .h(px(68.0))
@@ -1272,6 +1740,16 @@ impl Metro {
                     .text_color(ink)
                     .child(name),
             )
+            .with_animation(
+                ("qa-in", open_n * 100 + slot),
+                Animation::new(Duration::from_millis(total as u64)),
+                move |el, d| {
+                    let p = ((d * total - delay) / 320.0).clamp(0.0, 1.0);
+                    let e = ease_out(p);
+                    el.top(px((1.0 - e) * 28.0)).opacity(e)
+                },
+            )
+            .into_any_element()
     }
 
     /// One labelled slider row: min label, track, value, max label.
@@ -1428,6 +1906,7 @@ impl Metro {
                 },
                 self.wifi,
                 Self::toggle_wifi,
+                0,
                 cx,
             ))
             .child(self.quick_action(
@@ -1440,6 +1919,7 @@ impl Metro {
                 },
                 self.bluetooth,
                 Self::toggle_bluetooth,
+                1,
                 cx,
             ))
             .child(self.quick_action(
@@ -1448,6 +1928,7 @@ impl Metro {
                 IconName::Plane,
                 self.airplane,
                 Self::toggle_airplane,
+                2,
                 cx,
             ));
 
@@ -1464,6 +1945,7 @@ impl Metro {
                 },
                 self.quiet,
                 |this| this.quiet = !this.quiet,
+                3,
                 cx,
             ))
             .child(self.quick_action(
@@ -1472,6 +1954,7 @@ impl Metro {
                 IconName::Moon,
                 self.night_light,
                 |this| this.night_light = !this.night_light,
+                4,
                 cx,
             ))
             .child(self.quick_action(
@@ -1484,6 +1967,7 @@ impl Metro {
                 },
                 self.battery_saver,
                 |this| this.battery_saver = !this.battery_saver,
+                5,
                 cx,
             ));
 
@@ -1631,7 +2115,7 @@ impl Metro {
         } else {
             let mut rows: Vec<AnyElement> = Vec::with_capacity(NOTES.len());
             for (i, n) in NOTES.iter().enumerate() {
-                rows.push(self.note_row(n, i, cx).into_any_element());
+                rows.push(self.note_row(n, i, cx));
             }
             div().flex().flex_col().children(rows)
         };
@@ -1669,13 +2153,18 @@ impl Metro {
             .child(div().flex_1())
     }
 
-    fn note_row(&self, n: &Note, i: usize, cx: &mut Context<Self>) -> impl IntoElement {
+    /// One notification; rows slide in from the left one after another.
+    fn note_row(&self, n: &Note, i: usize, cx: &mut Context<Self>) -> AnyElement {
         let fg = self.fg();
         let a = &APPS[n.app];
         let hex = a.color.unwrap_or(self.accent);
         let app = n.app;
+        let open_n = self.panel_open_n;
+        let delay = 55.0 * i as f32;
+        let total = 320.0 + 55.0 * NOTES.len() as f32;
         div()
             .id(("note", i))
+            .relative()
             .flex()
             .items_start()
             .gap(px(10.0))
@@ -1726,27 +2215,46 @@ impl Metro {
                             .child(n.body),
                     ),
             )
+            .with_animation(
+                ("note-in", open_n * 100 + i),
+                Animation::new(Duration::from_millis(total as u64)),
+                move |el, d| {
+                    let p = ((d * total - delay) / 320.0).clamp(0.0, 1.0);
+                    let e = ease_out(p);
+                    el.left(px(-56.0 * (1.0 - e))).opacity(e)
+                },
+            )
+            .into_any_element()
     }
 
     /// The sliding surface itself. It is mounted while a panel is open (or still
-    /// animating out) and driven by a reversible `transition`, so both the
-    /// slide-down and the dismiss slide-up are smooth and follow live values.
+    /// animating out) and driven by a reversible `transition`. While the user is
+    /// pulling it, the transition collapses to ~1 ms so the panel tracks the pointer;
+    /// on release it eases the rest of the way open (or back up).
     fn panel_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
         let viewport_h = f32::from(window.viewport_size().height);
-        let panel_h = (viewport_h * 0.66).clamp(320.0, 560.0);
+        let panel_h = Self::panel_height_for(viewport_h);
         let open = self.panel.is_some() && !self.panel_closing;
 
+        let (slide_target, slide_ms) = if self.pulling {
+            (self.pull_y.clamp(0.0, panel_h), 1)
+        } else if open {
+            (panel_h, 320)
+        } else {
+            (0.0, 320)
+        };
         let slide = transition(
             ("panel", "slide"),
-            if open { panel_h } else { 0.0 },
-            Transition::new(Duration::from_millis(320)).easing(Easing::EaseInOut),
+            slide_target,
+            Transition::new(Duration::from_millis(slide_ms)).easing(Easing::EaseInOut),
             window,
             cx,
         );
         let scrim = transition(
             ("panel", "scrim"),
-            if open { 1.0f32 } else { 0.0 },
-            Transition::new(Duration::from_millis(260)).easing(Easing::EaseInOut),
+            (slide_target / panel_h).clamp(0.0, 1.0),
+            Transition::new(Duration::from_millis(if self.pulling { 1 } else { 260 }))
+                .easing(Easing::EaseInOut),
             window,
             cx,
         );
@@ -1771,7 +2279,7 @@ impl Metro {
                 scrim * if self.dark { 0.55 } else { 0.3 },
             ))
             .occlude()
-            .when(open, |d| {
+            .when(open && !self.pulling, |d| {
                 d.on_click(cx.listener(|this, _, _, cx| this.close_panel(cx)))
             });
 
@@ -1802,6 +2310,276 @@ impl Metro {
                 .size_full()
                 .child(scrim)
                 .child(panel)
+                .into_any_element(),
+        )
+    }
+
+    // ── launch splash ──
+
+    /// The coloured plate that grows from the tapped tile / card to the full page area,
+    /// then fades away to reveal the freshly opened app.
+    fn launch_layer(&self, width: f32) -> Option<AnyElement> {
+        let l = self.launch?;
+        let a = &APPS[l.app];
+        let hex = a.color.unwrap_or(self.accent);
+        let (x0, y0, w0, h0) = l.rect;
+        let (x1, y1, w1, h1) = (0.0, STATUS_H, width, self.page_h());
+        let icon_px = (w0.min(h0) * 0.5).clamp(24.0, 64.0);
+        let split = LAUNCH_SWAP_MS as f32 / LAUNCH_MS as f32;
+
+        Some(
+            div()
+                .id("launch-plate")
+                .absolute()
+                .left(px(x0))
+                .top(px(y0))
+                .w(px(w0))
+                .h(px(h0))
+                .bg(rgb(hex))
+                .overflow_hidden()
+                .flex()
+                .items_center()
+                .justify_center()
+                .occlude()
+                .child(glyph(a.icon, icon_px, on_color(hex)))
+                .with_animation(
+                    ("launch", l.n),
+                    Animation::new(Duration::from_millis(LAUNCH_MS)),
+                    move |el, d| {
+                        let grow = ease_in_out((d / split).min(1.0));
+                        let fade = ease_out(((d - split) / (1.0 - split)).clamp(0.0, 1.0));
+                        el.left(px(lerp(x0, x1, grow)))
+                            .top(px(lerp(y0, y1, grow)))
+                            .w(px(lerp(w0, w1, grow)))
+                            .h(px(lerp(h0, h1, grow)))
+                            .opacity(1.0 - fade)
+                    },
+                )
+                .into_any_element(),
+        )
+    }
+
+    // ── running apps switcher ──
+
+    /// One card: an app "thumbnail" that flies in (staggered), glides when its neighbours
+    /// leave, zooms open on tap and flicks away on ✕.
+    fn switcher_card(
+        &self,
+        i: usize,
+        app: usize,
+        g: SwGeo,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let a = &APPS[app];
+        let hex = a.color.unwrap_or(self.accent);
+        let ink = on_color(hex);
+        let inverse = inverse_ink(hex);
+        let (tx, ty) = Self::card_xy(i, g);
+        let x = self.tween_in("card-motion", app, "x", tx, 260, window, cx);
+        let y = self.tween_in("card-motion", app, "y", ty, 260, window, cx);
+        let (cw, ch) = (g.cw, g.ch);
+        let sn = self.switcher_n;
+        let dn = self.dismiss_n;
+
+        let face = div()
+            .absolute()
+            .overflow_hidden()
+            .bg(rgb(hex))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(glyph(a.icon, (cw * 0.36).min(72.0), ink))
+            .child(label(a.name, 1.0).text_color(ink))
+            .child(
+                div()
+                    .id(("card-close", app))
+                    .absolute()
+                    .top(px(6.0))
+                    .right(px(6.0))
+                    .size(px(26.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .bg(ink)
+                    .cursor_pointer()
+                    .active(|s| s.opacity(0.6))
+                    .child(glyph(IconName::X, 14.0, inverse))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        cx.stop_propagation();
+                        this.dismiss_app(app, cx);
+                    })),
+            );
+
+        let animated: AnyElement = if self.dismissing == Some(app) {
+            // Flick up and away.
+            face.with_animation(
+                ("card-out", app * 1000 + dn % 1000),
+                Animation::new(Duration::from_millis(260)),
+                move |el, d| {
+                    let e = ease_in_out(d);
+                    el.left(px(0.0))
+                        .top(px(-(ch + 30.0) * e))
+                        .w(px(cw))
+                        .h(px(ch))
+                        .opacity(1.0 - e)
+                },
+            )
+            .into_any_element()
+        } else if self.switcher_closing {
+            // Everyone shrinks back and drops a little while the scrim fades.
+            face.with_animation(
+                ("card-exit", app * 1000 + sn % 1000),
+                Animation::new(Duration::from_millis(240)),
+                move |el, d| {
+                    let e = ease_in_out(d);
+                    let s = 1.0 - 0.2 * e;
+                    el.left(px(cw * (1.0 - s) / 2.0))
+                        .top(px(ch * (1.0 - s) / 2.0 + 30.0 * e))
+                        .w(px(cw * s))
+                        .h(px(ch * s))
+                        .opacity(1.0 - e)
+                },
+            )
+            .into_any_element()
+        } else {
+            // Fly in from below, growing, one card after another.
+            let delay = 55.0 * i.min(7) as f32;
+            let total = 360.0 + delay;
+            face.with_animation(
+                ("card-in", app * 1000 + sn % 1000),
+                Animation::new(Duration::from_millis(total as u64)),
+                move |el, d| {
+                    let p = ((d * total - delay) / 360.0).clamp(0.0, 1.0);
+                    let e = ease_out(p);
+                    let s = 0.55 + 0.45 * e;
+                    el.left(px(cw * (1.0 - s) / 2.0))
+                        .top(px(ch * (1.0 - s) / 2.0 + (1.0 - e) * 70.0))
+                        .w(px(cw * s))
+                        .h(px(ch * s))
+                        .opacity(e)
+                },
+            )
+            .into_any_element()
+        };
+
+        div()
+            .id(("card", app))
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(cw))
+            .h(px(ch))
+            .cursor_pointer()
+            .on_click(cx.listener(move |this, _, _, cx| {
+                cx.stop_propagation();
+                this.launch_from_card(app, cx);
+            }))
+            .child(animated)
+            .into_any_element()
+    }
+
+    fn switcher_layer(&self, window: &mut Window, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.switcher {
+            return None;
+        }
+        let g = self.switcher_geo(self.last_w);
+        let n = self.running.len();
+        let rows = n.div_ceil(g.cols);
+        let page_h = self.page_h();
+        let content_h = (g.top + rows as f32 * (g.ch + g.gap) + 24.0).max(page_h);
+        let closing = self.switcher_closing;
+        let sn = self.switcher_n;
+
+        let mut cards: Vec<AnyElement> = Vec::with_capacity(n);
+        for (i, &app) in self.running.iter().enumerate() {
+            cards.push(self.switcher_card(i, app, g, window, cx));
+        }
+
+        let header = div()
+            .absolute()
+            .left(px(MARGIN))
+            .top(px(14.0))
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(white().opacity(0.6))
+                    .child("MULTITASKING"),
+            )
+            .child(
+                div()
+                    .text_size(px(28.0))
+                    .line_height(px(32.0))
+                    .font_weight(FontWeight::LIGHT)
+                    .text_color(white())
+                    .child("running apps"),
+            );
+
+        let scrim = div()
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .with_animation(
+                (
+                    if closing {
+                        "sw-scrim-out"
+                    } else {
+                        "sw-scrim-in"
+                    },
+                    sn,
+                ),
+                Animation::new(Duration::from_millis(240)),
+                move |el, d| {
+                    let a = if closing { 1.0 - d } else { d };
+                    el.bg(hsla(0.0, 0.0, 0.0, 0.66 * a))
+                },
+            );
+
+        let scroll = div()
+            .id("switcher-scroll")
+            .size_full()
+            .overflow_y_scroll()
+            .track_scroll(&self.switcher_scroll)
+            // Tapping the empty area between cards dismisses the switcher.
+            .on_click(cx.listener(|this, _, _, cx| this.close_switcher(cx)))
+            .child(
+                div()
+                    .relative()
+                    .w_full()
+                    .h(px(content_h))
+                    .child(header)
+                    .children(cards)
+                    .when(n == 0, |d| {
+                        d.child(
+                            div()
+                                .absolute()
+                                .left(px(0.0))
+                                .top(px(g.top + 60.0))
+                                .w_full()
+                                .text_center()
+                                .text_size(px(14.0))
+                                .text_color(white().opacity(0.6))
+                                .child("No running apps"),
+                        )
+                    }),
+            );
+
+        Some(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(STATUS_H))
+                .w_full()
+                .h(px(page_h))
+                .overflow_hidden()
+                .occlude()
+                .child(scrim)
+                .child(scroll)
                 .into_any_element(),
         )
     }
@@ -1942,8 +2720,10 @@ fn glyph(icon: IconName, size: f32, color: Hsla) -> Icon {
     Icon::new(icon).w(px(size)).h(px(size)).text_color(color)
 }
 
-fn pivot_header(small: String, big: String) -> Div {
-    div()
+/// Pivot header. With `key` set, the big title slides in from the right and fades in
+/// (the Windows Phone page-enter feel); the key makes it replay once per navigation.
+fn pivot_header(small: String, big: String, key: Option<usize>) -> AnyElement {
+    let header = div()
         .pt(px(8.0))
         .pb(px(12.0))
         .child(
@@ -1958,7 +2738,53 @@ fn pivot_header(small: String, big: String) -> Div {
                 .line_height(px(60.0))
                 .font_weight(FontWeight::LIGHT)
                 .child(big),
+        );
+    match key {
+        Some(k) => header
+            .with_animation(
+                ("pivot", k),
+                Animation::new(Duration::from_millis(460)).with_easing(ease_out_quint()),
+                |el, d| el.relative().left(px(90.0 * (1.0 - d))).opacity(d),
+            )
+            .into_any_element(),
+        None => header.into_any_element(),
+    }
+}
+
+/// Wrap a tile's plate for a turnstile transition: the plate keeps its full size inside a
+/// clip whose width collapses toward the left edge (like a card hinged on its left side),
+/// fading as it goes. `delay` (ms) staggers tiles.
+fn turnstile(plate: Div, w: f32, h: f32, id: usize, turn: Turn, delay: f32) -> AnyElement {
+    let (key, leaving) = match turn {
+        Turn::Idle => return plate.into_any_element(),
+        Turn::Enter(k) => (k, false),
+        Turn::Leave(k) => (k, true),
+    };
+    const DUR: f32 = 380.0;
+    let total = DUR + delay;
+    div()
+        .relative()
+        .h_full()
+        .overflow_hidden()
+        .child(plate.w(px(w)).h(px(h)))
+        .with_animation(
+            (
+                if leaving { "tile-leave" } else { "tile-enter" },
+                id * 100_000 + key % 100_000,
+            ),
+            Animation::new(Duration::from_millis(total as u64)),
+            move |el, d| {
+                let p = ((d * total - delay) / DUR).clamp(0.0, 1.0);
+                let e = ease_out(p);
+                let (s, a) = if leaving {
+                    (1.0 - 0.8 * e, 1.0 - e)
+                } else {
+                    (0.25 + 0.75 * e, e)
+                };
+                el.w(px(w * s)).opacity(a)
+            },
         )
+        .into_any_element()
 }
 
 impl Metro {
@@ -1985,8 +2811,8 @@ impl Metro {
                 hsla(0.0, 0.0, 1.0, 0.40)
             })
             .cursor_pointer()
-            // Press starts a potential pull; a short downward drag opens the
-            // panel for the half of the bar the gesture began on.
+            // Press starts a potential pull. Dragging down makes the panel follow the
+            // pointer (see `pointer_move`); a plain click toggles it.
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseDownEvent, _, _| {
@@ -1996,6 +2822,9 @@ impl Metro {
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    if this.pulling {
+                        return; // the pull is committed / cancelled in `pointer_up`
+                    }
                     if this.pull_start.take().is_some() {
                         this.toggle_panel(f32::from(e.position.x), cx);
                     }
@@ -2047,15 +2876,17 @@ impl Metro {
                 .cursor_pointer()
                 .active(|s| s.opacity(0.4))
         };
+        let holding = self.home_press.is_some();
         let logo = div()
             .flex()
             .flex_wrap()
             .w(px(20.0))
             .gap(px(2.0))
+            .when(holding, |d| d.opacity(0.55))
             .children((0..4).map(|_| div().size(px(9.0)).bg(fg)));
 
         div()
-            .h(px(52.0))
+            .h(px(NAV_H))
             .flex()
             .items_center()
             .bg(if self.dark {
@@ -2070,14 +2901,37 @@ impl Metro {
                     .on_click(cx.listener(|this, _, _, cx| this.back(cx))),
             )
             .child(
+                // Tap = Start, hold = running apps.
                 btn("nav-start")
                     .child(logo)
-                    .on_click(cx.listener(|this, _, _, cx| this.home(cx))),
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseDownEvent, _, cx| this.home_down(cx)),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                            if this.home_press.take().is_some() {
+                                cx.notify();
+                            }
+                        }),
+                    )
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        if this.home_long {
+                            // This release ended a long press that already opened the switcher.
+                            this.home_long = false;
+                        } else {
+                            this.home(cx);
+                        }
+                    })),
             )
             .child(
                 btn("nav-search")
                     .child(glyph(IconName::Search, 24.0, fg))
                     .on_click(cx.listener(|this, _, _, cx| {
+                        if this.launch.is_some() {
+                            return;
+                        }
                         if this.page == Page::Apps {
                             // Already there: put the caret back in the search field.
                             this.search_pending = true;
@@ -2252,10 +3106,12 @@ impl Metro {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn tile_view(
         &self,
         ix: usize,
         pos: (usize, usize),
+        entering: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
@@ -2289,6 +3145,25 @@ impl Metro {
             icon: APPS[t.app].icon,
         };
 
+        // Turnstile: tiles turn *away* (staggered by distance) when another tile is
+        // launched, and turn *in* (staggered row by row) whenever Start is shown again.
+        let (turn, delay) = if let Some(l) = self.launch.filter(|_| entering) {
+            if l.tile == Some(id) {
+                (Turn::Idle, 0.0)
+            } else {
+                let dist =
+                    (pos.0 as f32 - l.from.0 as f32).abs() + (pos.1 as f32 - l.from.1 as f32).abs();
+                (Turn::Leave(l.n), (dist * 22.0).min(160.0))
+            }
+        } else if entering && self.nav_at.elapsed().as_millis() < ENTER_WINDOW_MS {
+            (
+                Turn::Enter(self.nav),
+                (pos.1 as f32 * 45.0 + pos.0 as f32 * 12.0).min(320.0),
+            )
+        } else {
+            (Turn::Idle, 0.0)
+        };
+
         let circle_btn = |bid: &'static str, icon: IconName| {
             div()
                 .id(bid)
@@ -2301,6 +3176,41 @@ impl Metro {
                 .bg(ink)
                 .child(glyph(icon, 14.0, inverse))
         };
+
+        let plate = div()
+            .relative()
+            .size_full()
+            .overflow_hidden()
+            .bg(color)
+            .when(editing, |d| d.border_2().border_color(ink))
+            .child(content)
+            .when(editing, |d| {
+                d.child(
+                    circle_btn("unpin", IconName::X)
+                        .top(px(4.0))
+                        .right(px(4.0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.tiles.retain(|t| t.id != id);
+                            this.edit = None;
+                            this.save_soon(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
+                )
+                .child(
+                    circle_btn("resize", IconName::ArrowLeftRight)
+                        .bottom(px(4.0))
+                        .right(px(4.0))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            if let Some(t) = this.tiles.iter_mut().find(|t| t.id == id) {
+                                t.size = t.size.next();
+                            }
+                            this.save_soon(cx);
+                            cx.stop_propagation();
+                            cx.notify();
+                        })),
+                )
+            });
 
         div()
             .id(("tile", id))
@@ -2324,9 +3234,9 @@ impl Metro {
                 if this.edit.is_some() {
                     this.edit = None;
                     cx.notify();
-                } else if let Some(t) = this.tiles.iter().find(|t| t.id == id) {
-                    let a = t.app;
-                    this.open_app(a, cx);
+                } else {
+                    // Zoom the tile open; the rest turnstile away.
+                    this.launch_from_tile(id, cx);
                 }
             }))
             // Drag to replace (edit mode only): ghost follows the pointer, target highlights.
@@ -2343,42 +3253,7 @@ impl Metro {
                 this.drop_handled = true;
                 this.move_tile(d.id, id, cx);
             }))
-            .child(
-                div()
-                    .relative()
-                    .size_full()
-                    .overflow_hidden()
-                    .bg(color)
-                    .when(editing, |d| d.border_2().border_color(ink))
-                    .child(content)
-                    .when(editing, |d| {
-                        d.child(
-                            circle_btn("unpin", IconName::X)
-                                .top(px(4.0))
-                                .right(px(4.0))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    this.tiles.retain(|t| t.id != id);
-                                    this.edit = None;
-                                    this.save_soon(cx);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                })),
-                        )
-                        .child(
-                            circle_btn("resize", IconName::ArrowLeftRight)
-                                .bottom(px(4.0))
-                                .right(px(4.0))
-                                .on_click(cx.listener(move |this, _, _, cx| {
-                                    if let Some(t) = this.tiles.iter_mut().find(|t| t.id == id) {
-                                        t.size = t.size.next();
-                                    }
-                                    this.save_soon(cx);
-                                    cx.stop_propagation();
-                                    cx.notify();
-                                })),
-                        )
-                    }),
-            )
+            .child(turnstile(plate, w, h, id, turn, delay))
     }
 
     // ── pages ──
@@ -2387,13 +3262,14 @@ impl Metro {
         &self,
         layout: &[(usize, usize)],
         rows: usize,
+        entering: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let fg = self.fg();
         let tiles: Vec<AnyElement> = (0..self.tiles.len())
             .map(|ix| {
-                self.tile_view(ix, layout[ix], window, cx)
+                self.tile_view(ix, layout[ix], entering, window, cx)
                     .into_any_element()
             })
             .collect();
@@ -2408,6 +3284,7 @@ impl Metro {
             .id("start-scroll")
             .size_full()
             .overflow_y_scroll()
+            .track_scroll(&self.start_scroll)
             .on_click(cx.listener(|this, _, _, cx| {
                 if this.edit.is_some() {
                     this.edit = None;
@@ -2442,7 +3319,11 @@ impl Metro {
                                 .cursor_pointer()
                                 .active(|s| s.opacity(0.5))
                                 .child(glyph(IconName::ArrowRight, 24.0, fg))
-                                .on_click(cx.listener(|this, _, _, cx| this.go(Page::Apps, cx))),
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if this.launch.is_none() {
+                                        this.go(Page::Apps, cx);
+                                    }
+                                })),
                         ),
                     ),
             )
@@ -2507,7 +3388,7 @@ impl Metro {
             )
     }
 
-    fn apps_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn apps_page(&self, key: Option<usize>, cx: &mut Context<Self>) -> impl IntoElement {
         let fg = self.fg();
         let query = self.search.trim().to_lowercase();
 
@@ -2636,13 +3517,13 @@ impl Metro {
                     .flex()
                     .flex_col()
                     .pb(px(28.0))
-                    .child(pivot_header("All Apps".into(), "Apps".into()))
+                    .child(pivot_header("All Apps".into(), "Apps".into(), key))
                     .child(search)
                     .children(list),
             )
     }
 
-    fn settings_page(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn settings_page(&self, key: Option<usize>, cx: &mut Context<Self>) -> impl IntoElement {
         let fg = self.fg();
 
         let themes: Vec<_> = [("Dark", true), ("Light", false)]
@@ -2787,7 +3668,7 @@ impl Metro {
                     .flex()
                     .flex_col()
                     .pb(px(28.0))
-                    .child(pivot_header("Settings".into(), "Theme".into()))
+                    .child(pivot_header("Settings".into(), "Theme".into(), key))
                     .child(caption("Theme"))
                     .child(div().flex().gap(px(24.0)).children(themes))
                     .child(caption("Wallpaper"))
@@ -2816,51 +3697,92 @@ impl Metro {
             )
     }
 
-    fn app_page(&self, i: usize) -> impl IntoElement {
+    /// Placeholder app page. With `anim` set, the header slides in, the icon pops in and the
+    /// text trails after it — the "app content arrives as the splash fades" feel.
+    fn app_page(&self, i: usize, anim: Option<usize>) -> impl IntoElement {
         let a = &APPS[i];
         let app_hex = a.color.unwrap_or(self.accent);
+
+        let icon = div()
+            .size(px(120.0))
+            .rounded_full()
+            .bg(rgb(app_hex))
+            .flex()
+            .items_center()
+            .justify_center()
+            .child(glyph(a.icon, 60.0, on_color(app_hex)));
+        let icon: AnyElement = match anim {
+            Some(k) => icon
+                .with_animation(
+                    ("app-icon", k),
+                    Animation::new(Duration::from_millis(520)).with_easing(ease_out_quint()),
+                    |el, d| el.size(px(120.0 * (0.5 + 0.5 * d))).opacity(d),
+                )
+                .into_any_element(),
+            None => icon.into_any_element(),
+        };
+
+        let text = div()
+            .w_full()
+            .text_size(px(18.0))
+            .font_weight(FontWeight::LIGHT)
+            .child(format!(
+                "This is where the {} app would live. Press ← to go back to Start.",
+                a.name
+            ));
+        let text: AnyElement = match anim {
+            Some(k) => text
+                .with_animation(
+                    ("app-text", k),
+                    Animation::new(Duration::from_millis(640)).with_easing(ease_out_quint()),
+                    |el, d| el.relative().left(px(70.0 * (1.0 - d))).opacity(d),
+                )
+                .into_any_element(),
+            None => text.into_any_element(),
+        };
+
         div()
             .size_full()
             .px(px(MARGIN))
-            .child(pivot_header("App".into(), a.name.into()))
+            .child(pivot_header("App".into(), a.name.into(), anim))
             .child(
                 div()
                     .mt(px(10.0))
                     .flex()
                     .flex_col()
                     .gap(px(20.0))
+                    // Fixed 120×120 slot so the text below doesn't jump while the icon grows.
                     .child(
                         div()
                             .size(px(120.0))
-                            .rounded_full()
-                            .bg(rgb(app_hex))
                             .flex()
                             .items_center()
                             .justify_center()
-                            .child(glyph(a.icon, 60.0, on_color(app_hex))),
+                            .child(icon),
                     )
-                    .child(
-                        div()
-                            .w_full()
-                            .text_size(px(18.0))
-                            .font_weight(FontWeight::LIGHT)
-                            .child(format!(
-                                "This is where the {} app would live. Press ← to go back to Start.",
-                                a.name
-                            )),
-                    ),
+                    .child(text),
             )
     }
-    fn page_element(&self, page: Page, window: &mut Window, cx: &mut Context<Self>) -> AnyElement {
+
+    /// `entering` = this is the page being shown (as opposed to the outgoing page that is
+    /// still painted while it peels away): only then do the page-enter animations run.
+    fn page_element(
+        &self,
+        page: Page,
+        entering: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let key = entering.then_some(self.nav);
         match page {
             Page::Start => {
                 let (layout, rows) = self.pack();
-                self.start_page(&layout, rows, window, cx)
+                self.start_page(&layout, rows, entering, window, cx)
                     .into_any_element()
             }
-            Page::Apps => self.apps_page(cx).into_any_element(),
-            Page::Settings => self.settings_page(cx).into_any_element(),
-            Page::App(i) => self.app_page(i).into_any_element(),
+            Page::Apps => self.apps_page(key, cx).into_any_element(),
+            Page::Settings => self.settings_page(key, cx).into_any_element(),
+            Page::App(i) => self.app_page(i, key).into_any_element(),
         }
     }
 
@@ -2878,7 +3800,7 @@ impl Metro {
             return None;
         }
         let prev = self.prev_page?;
-        let old_page = self.page_element(prev, window, cx);
+        let old_page = self.page_element(prev, false, window, cx);
         let backdrop = if prev == Page::Start {
             hsla(0.0, 0.0, 0.0, 0.0)
         } else {
@@ -2940,19 +3862,13 @@ impl Metro {
 
 // ───────────────────────────── root ─────────────────────────────
 
-/// Final write on shutdown, so a change made inside the debounce window is kept.
-impl Drop for Metro {
-    fn drop(&mut self) {
-        save_config(&self.config());
-    }
-}
-
 impl Render for Metro {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Auto-fit: re-derive columns / cell size / font scale from the width the page area
         // is *actually* laid out at. `window.viewport_size()` can disagree with the real
         // layout width (window chrome / borders / DPI), which made the grid too wide and
         // clipped the right-hand tiles, so it is only the fallback for the first frame.
+        self.vh = f32::from(window.viewport_size().height);
         let width = if self.measured_w > 0.0 {
             self.measured_w
         } else {
@@ -2963,7 +3879,7 @@ impl Render for Metro {
 
         self.maybe_focus_search(window, cx);
 
-        let page = self.page_element(self.page, window, cx);
+        let page = self.page_element(self.page, true, window, cx);
         let page_backdrop = if self.page == Page::Start {
             hsla(0.0, 0.0, 0.0, 0.0)
         } else {
@@ -2974,7 +3890,27 @@ impl Render for Metro {
 
         let dim = (1.0 - self.brightness) * 0.6;
         let status_bar = self.status_bar(cx);
+        let switcher_layer = self.switcher_layer(window, cx);
+        let launch_layer = self.launch_layer(width);
         let panel_layer = self.panel_layer(window, cx);
+
+        // While a pull or a slider drag is in progress, a transparent layer sits above the
+        // (pointer-occluding) panel so the gesture keeps receiving move / up events.
+        let catcher = (self.pulling || self.drag.is_some()).then(|| {
+            div()
+                .id("gesture-catcher")
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .size_full()
+                .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+                    this.pointer_move(e, cx);
+                }))
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|this, _: &MouseUpEvent, _, cx| this.pointer_up(cx)),
+                )
+        });
 
         div()
             .id("root")
@@ -2982,31 +3918,14 @@ impl Render for Metro {
             .size_full()
             .text_color(self.fg())
             .font_family("Segoe UI")
-            // A drag that starts on the status bar and travels down opens a panel;
+            // A drag that starts on the status bar and travels down pulls a panel with it;
             // the half of the bar it started on picks which one.
             .on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
-                if let Some(drag) = this.drag {
-                    this.apply_drag(drag, f32::from(e.position.x));
-                    cx.notify();
-                } else if let Some((x, y)) = this.pull_start
-                    && e.dragging()
-                    && f32::from(e.position.y) - y > 22.0
-                {
-                    this.pull_start = None;
-                    let kind = this.panel_for_x(x);
-                    this.open_panel(kind, cx);
-                }
+                this.pointer_move(e, cx);
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| {
-                    this.pull_start = None;
-                    if this.drag.take().is_some() {
-                        // Brightness / gap / transparency were being scrubbed.
-                        this.save_soon(cx);
-                        cx.notify();
-                    }
-                }),
+                cx.listener(|this, _: &MouseUpEvent, _, cx| this.pointer_up(cx)),
             )
             .child(self.wallpaper_view())
             .child(
@@ -3022,15 +3941,19 @@ impl Render for Metro {
                             .min_h_0()
                             .relative()
                             .overflow_hidden()
-                            // Invisible probe: reports the real width of this area every frame and
+                            // Invisible probe: reports the real size of this area every frame and
                             // asks for a re-render only when it actually changed (no feedback loop).
                             .child(
                                 canvas(
                                     move |bounds, _window, cx| {
                                         let w = f32::from(bounds.size.width);
+                                        let h = f32::from(bounds.size.height);
                                         me.update(cx, |this, cx| {
-                                            if (this.measured_w - w).abs() > 0.5 {
+                                            if (this.measured_w - w).abs() > 0.5
+                                                || (this.measured_h - h).abs() > 0.5
+                                            {
                                                 this.measured_w = w;
+                                                this.measured_h = h;
                                                 cx.notify();
                                             }
                                         });
@@ -3046,6 +3969,10 @@ impl Render for Metro {
                     )
                     .child(self.nav_bar(cx)),
             )
+            // Running-apps cards (long-press Start).
+            .when_some(switcher_layer, |d, layer| d.child(layer))
+            // App launch zoom plate, above the switcher so cards can zoom open too.
+            .when_some(launch_layer, |d, layer| d.child(layer))
             // Screen brightness: dim everything below the panels.
             .when(dim > 0.001, |d| {
                 d.child(
@@ -3059,7 +3986,15 @@ impl Render for Metro {
             })
             // Sliding panel sits above the content but under the status bar.
             .when_some(panel_layer, |d, layer| d.child(layer))
+            .when_some(catcher, |d, c| d.child(c))
             .child(status_bar)
+    }
+}
+
+/// Final write on shutdown, so a change made inside the debounce window is kept.
+impl Drop for Metro {
+    fn drop(&mut self) {
+        save_config(&self.config());
     }
 }
 
