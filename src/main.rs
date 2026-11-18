@@ -7,22 +7,30 @@
 //!     and fonts / icons scale with the cell size.
 //!   • A first-fit packer flows tiles into the grid, so gaps are back-filled just like the
 //!     real Start screen. Tiles glide to their new place / size (GPUI Base `transition`).
-//!   • A selectable Metro wallpaper sits behind the tiles; tile ink flips between black and
-//!     white based on the accent luminance so every label stays readable.
+//!   • The tiles view uses a tight side margin (`TILE_MARGIN`) so the grid runs nearly
+//!     edge to edge like a phone.
+//!   • A selectable Metro wallpaper (gradient preset or an image from `./wallpapers`) sits
+//!     behind the tiles; tile ink flips between black and white based on the accent
+//!     luminance so every label stays readable.
 //!
 //! Interactions
 //!   • Live tiles flip on their own (staggered), clock ticks every second
 //!   • App launch: press a tile -> it squishes, release and the tile zooms to fill the page
 //!     while every other tile "turnstiles" away (staggered by distance from the tapped tile).
 //!     The app's content then slides in. Going back turns the tiles back in, row by row.
-//!   • Right-click a tile -> edit mode: ✕ unpins, ↔ cycles small → medium → wide → large
+//!   • LONG-PRESS a tile (~0.42 s): it lifts into edit mode. Drag on to re-arrange it, or
+//!     release without moving to open the size menu (Small / Medium / Wide / Full + unpin).
+//!   • Right-click a tile also opens edit mode / its size entry points.
+//!   • LONG-PRESS empty space: tile editing mode — all tiles wiggle, a bottom bar offers
+//!     the gap stepper and "Add +", which lists unpinned apps to put on Start.
 //!   • Small tiles are icon-only: captions, badges and live info are hidden
 //!   • Long labels are clamped with an ellipsis, so tile text never spills out
 //!   • In edit mode, DRAG a tile onto another tile to take its place; everything re-packs.
 //!     Dropping on empty space sends it to the end.
 //!   • Arrow at the end of the tiles -> All Apps: category headings, a search field at
 //!     the top, rectangular icon borders (right-click an app to pin/unpin)
-//!   • Settings tile -> theme + wallpaper + accent, tile gap and tile transparency
+//!   • Settings tile -> theme, accent, tile gap / transparency, gradient presets and the
+//!     images found in the wallpapers folder
 //!   • The status bar never hides: it is the always-on top layer. Pull down on its
 //!     left half for notifications, on its right half for the system panel. The panel
 //!     follows the pointer while you pull; release past ~30 % to keep it open, otherwise
@@ -38,6 +46,7 @@
 //!   • Default path: `$XDG_CONFIG_HOME|~/.config/horn/config.json`, `%APPDATA%\horn\
 //!     config.json` on Windows, `~/Library/Application Support/horn/config.json` on
 //!     macOS. Set `HORN_CONFIG` to override it with an explicit file path.
+//!   • Wallpaper images are read from `./wallpapers` (override with `HORN_WALLPAPERS`).
 //!
 //! Window
 //!   • The host window opens 476 px wide at full usable screen height, centred.
@@ -48,7 +57,7 @@ use gpui_kit::prelude::*;
 use gpui_kit::*;
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 // ───────────────────────────── assets ─────────────────────────────
@@ -121,7 +130,8 @@ const ACCENTS: [u32; 20] = [
 ];
 
 // Layout constants (logical px)
-const MARGIN: f32 = 20.0; // left/right page margin
+const MARGIN: f32 = 20.0; // left/right page margin (lists, settings)
+const TILE_MARGIN: f32 = 6.0; // left/right margin in the tiles view (tight, phone-like)
 const DEFAULT_GAP: f32 = 10.0; // default gap between tiles (user adjustable)
 const GAP_MIN: f32 = 0.0;
 const GAP_MAX: f32 = 28.0;
@@ -139,6 +149,8 @@ const HOME_HOLD_MS: u64 = 450; // long-press threshold on the Start button
 const ENTER_WINDOW_MS: u128 = 950; // tiles keep their turnstile-in wrapper for this long
 const PULL_COMMIT: f32 = 0.30; // fraction of the panel that must be pulled to keep it open
 const MAX_RUNNING: usize = 8;
+const TILE_HOLD_MS: u64 = 420; // long-press on a tile: lift it / open the size menu
+const PAGE_HOLD_MS: u64 = 500; // long-press on empty Start area: enter tile edit mode
 
 // Wallpaper presets: (top-left, bottom-right). Each theme gets its own set so the
 // foreground text stays readable without a heavy scrim.
@@ -157,6 +169,59 @@ const WALLPAPERS_LIGHT: [(u32, u32); 5] = [
     (0xFCEFE4, 0xF2CDB4), // Ember
 ];
 const WALLPAPER_NAMES: [&str; 5] = ["Dusk", "Graphite", "Plum", "Ocean", "Ember"];
+
+// ───────────────────────────── wallpapers on disk ─────────────────────────────
+
+/// Folder scanned for user wallpapers: `./wallpapers` unless overridden.
+fn wallpaper_dir() -> PathBuf {
+    std::env::var_os("HORN_WALLPAPERS")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("wallpapers"))
+}
+
+fn is_image_file(path: &Path) -> bool {
+    let ext = path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.to_ascii_lowercase());
+    matches!(
+        ext.as_deref(),
+        Some("png" | "jpg" | "jpeg" | "webp" | "bmp" | "gif" | "tif" | "tiff")
+    )
+}
+
+/// Wallpaper images found in the wallpapers folder, sorted by path.
+fn scan_wallpapers() -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(wallpaper_dir()) else {
+        return Vec::new();
+    };
+    let mut files: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file() && is_image_file(path))
+        .collect();
+    files.sort();
+    files
+}
+
+/// Resolve a stored wallpaper path, accepting a full path or a bare file name
+/// inside the wallpapers folder.
+fn resolve_wallpaper(path: &str) -> Option<PathBuf> {
+    let direct = PathBuf::from(path);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let in_dir = wallpaper_dir().join(path);
+    in_dir.is_file().then_some(in_dir)
+}
+
+/// A short label for a wallpaper file (`sunset.jpg` → `sunset`).
+fn wallpaper_label(path: &Path) -> String {
+    path.file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("wallpaper")
+        .to_string()
+}
 
 // ───────────────────────────── motion helpers ─────────────────────────────
 
@@ -368,6 +433,9 @@ struct Config {
     accent: u32,
     #[serde(default)]
     wallpaper: usize,
+    /// Absolute or `wallpapers/…` path to a wallpaper image; wins over the preset.
+    #[serde(default)]
+    wallpaper_file: Option<String>,
     #[serde(default = "default_gap")]
     gap: f32,
     #[serde(default = "default_alpha")]
@@ -537,6 +605,7 @@ impl Default for Config {
             dark: default_dark(),
             accent: default_accent(),
             wallpaper: 0,
+            wallpaper_file: None,
             gap: DEFAULT_GAP,
             tile_alpha: 1.0,
             brightness: 1.0,
@@ -552,6 +621,9 @@ impl Config {
         self.gap = self.gap.clamp(GAP_MIN, GAP_MAX);
         self.tile_alpha = self.tile_alpha.clamp(TILE_ALPHA_MIN, 1.0);
         self.brightness = self.brightness.clamp(0.05, 1.0);
+        self.wallpaper_file = self
+            .wallpaper_file
+            .filter(|path| resolve_wallpaper(path).is_some());
         self.tiles.retain(|tile| app_index(&tile.app).is_some());
         if self.tiles.is_empty() {
             self.tiles = default_tiles();
@@ -785,6 +857,25 @@ struct SwGeo {
     top: f32,
 }
 
+/// A press-and-hold in progress on a tile: arming lifts the tile, moving drags it,
+/// releasing without moving opens the size menu.
+#[derive(Clone, Copy)]
+struct TileHold {
+    id: usize,
+    token: usize,
+    start: (f32, f32),
+    armed: bool,
+    moved: bool,
+}
+
+/// The floating size menu opened by a long press that did not move.
+#[derive(Clone, Copy)]
+struct TileMenu {
+    id: usize,
+    x: f32,
+    y: f32,
+}
+
 /// Payload carried while a tile is being dragged. Also renders the drag "ghost".
 #[derive(Clone)]
 struct DraggedTile {
@@ -881,6 +972,19 @@ struct Metro {
     search: String,
     search_focus: FocusHandle,
     search_pending: bool,
+    // tile editing / long-press on the Start screen
+    editing: bool,
+    tile_hold: Option<TileHold>,
+    hold_token: usize,
+    tile_menu: Option<TileMenu>,
+    suppress_click: Option<usize>,
+    empty_hold: Option<(usize, f32, f32)>,
+    empty_token: usize,
+    add_sheet: bool,
+    suppress_page_click: bool,
+    // wallpapers found on disk
+    wallpaper_files: Vec<PathBuf>,
+    wallpaper_file: Option<PathBuf>,
     // debounced config persistence
     save_token: usize,
 }
@@ -959,11 +1063,22 @@ impl Metro {
             press_n: 0,
             home_long: false,
             wallpaper: config.wallpaper,
+            wallpaper_file: config.wallpaper_file.as_deref().and_then(resolve_wallpaper),
+            wallpaper_files: scan_wallpapers(),
             gap: config.gap,
             tile_alpha: config.tile_alpha,
             search: String::new(),
             search_focus: cx.focus_handle(),
             search_pending: false,
+            editing: false,
+            tile_hold: None,
+            hold_token: 0,
+            tile_menu: None,
+            suppress_click: None,
+            empty_hold: None,
+            empty_token: 0,
+            add_sheet: false,
+            suppress_page_click: false,
             save_token: 0,
         };
         me.stamp();
@@ -982,7 +1097,7 @@ impl Metro {
         self.secs += 1;
         self.drop_handled = false;
         self.stamp();
-        if self.edit.is_none() {
+        if self.edit.is_none() && !self.editing {
             let secs = self.secs;
             for t in self.tiles.iter_mut() {
                 if t.faces.len() > 1 && (secs + t.offset) % 6 == 0 {
@@ -1000,7 +1115,7 @@ impl Metro {
     /// Pick an even column count (≥ 4) and a cell size so the grid exactly fills the window.
     fn relayout(&mut self, width: f32) {
         let gap = self.gap;
-        let avail = (width - 2.0 * MARGIN).max(200.0);
+        let avail = (width - 2.0 * TILE_MARGIN).max(200.0);
         let cols =
             ((((avail + gap) / (TARGET_CELL + gap)) / 2.0).round() as usize * 2).clamp(4, 16);
         self.cell = (avail - gap * (cols as f32 - 1.0)) / cols as f32;
@@ -1130,6 +1245,10 @@ impl Metro {
             dark: self.dark,
             accent: self.accent,
             wallpaper: self.wallpaper,
+            wallpaper_file: self
+                .wallpaper_file
+                .as_ref()
+                .map(|path| path.to_string_lossy().to_string()),
             gap: self.gap,
             tile_alpha: self.tile_alpha,
             brightness: self.brightness,
@@ -1174,9 +1293,14 @@ impl Metro {
         self.dark = defaults.dark;
         self.accent = defaults.accent;
         self.wallpaper = defaults.wallpaper;
+        self.wallpaper_file = None;
         self.gap = defaults.gap;
         self.tile_alpha = defaults.tile_alpha;
         self.brightness = defaults.brightness;
+        self.editing = false;
+        self.edit = None;
+        self.tile_menu = None;
+        self.add_sheet = false;
         self.rebuild_tiles(&defaults.tiles);
         self.save_soon(cx);
         cx.notify();
@@ -1209,7 +1333,16 @@ impl Metro {
         self.nav += 1;
         self.nav_at = Instant::now();
         self.edit = None;
+        self.editing = false;
+        self.tile_menu = None;
+        self.add_sheet = false;
+        self.tile_hold = None;
+        self.empty_hold = None;
         self.page_morph = true;
+        if page == Page::Settings {
+            // Pick up wallpapers dropped into the folder since launch.
+            self.wallpaper_files = scan_wallpapers();
+        }
         self.note_running(page);
         if page == Page::Apps {
             self.search_pending = true;
@@ -1238,7 +1371,9 @@ impl Metro {
         if self.launch.is_some() {
             return;
         }
-        if self.panel.is_some() {
+        if self.tile_menu.is_some() || self.add_sheet || self.editing {
+            self.exit_editing(cx);
+        } else if self.panel.is_some() {
             self.close_panel(cx);
         } else if self.switcher && !self.switcher_closing {
             self.close_switcher(cx);
@@ -1258,6 +1393,9 @@ impl Metro {
             return;
         }
         self.history.clear();
+        self.editing = false;
+        self.tile_menu = None;
+        self.add_sheet = false;
         if self.switcher && !self.switcher_closing {
             self.close_switcher(cx);
         }
@@ -1308,7 +1446,7 @@ impl Metro {
         let (c, r) = layout[ix];
         let (cw, ch) = t.size.cells();
         let (cell, g) = (self.cell, self.gap);
-        let x = MARGIN + c as f32 * (cell + g);
+        let x = TILE_MARGIN + c as f32 * (cell + g);
         let y = STATUS_H + 8.0 + r as f32 * (cell + g) + f32::from(self.start_scroll.offset().y);
         let w = cw as f32 * cell + (cw as f32 - 1.0) * g;
         let h = ch as f32 * cell + (ch as f32 - 1.0) * g;
@@ -1540,6 +1678,9 @@ impl Metro {
         self.panel_token += 1;
         self.panel_open_n += 1;
         self.edit = None;
+        self.editing = false;
+        self.tile_menu = None;
+        self.add_sheet = false;
         self.pull_start = None;
         cx.notify();
     }
@@ -1592,7 +1733,102 @@ impl Metro {
 
     // ── pointer tracking (root + gesture catcher) ──
 
+    /// Start the long-press timer for a tile. Arming lifts it into edit mode; a
+    /// following drag moves it, and a release without movement opens the size menu.
+    fn begin_tile_hold(&mut self, id: usize, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.hold_token = self.hold_token.wrapping_add(1);
+        let token = self.hold_token;
+        self.tile_hold = Some(TileHold {
+            id,
+            token,
+            start: (x, y),
+            armed: false,
+            moved: false,
+        });
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(TILE_HOLD_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let Some(hold) = this.tile_hold else { return };
+                if hold.token == token && !hold.moved {
+                    this.tile_hold = Some(TileHold {
+                        armed: true,
+                        ..hold
+                    });
+                    this.edit = Some(hold.id);
+                    this.editing = true;
+                    this.tile_menu = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Long-press on empty Start area enters tile edit mode (wiggle + bottom bar).
+    fn begin_empty_hold(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
+        self.empty_token = self.empty_token.wrapping_add(1);
+        let token = self.empty_token;
+        self.empty_hold = Some((token, x, y));
+        cx.spawn(async move |this, cx| {
+            cx.background_executor()
+                .timer(Duration::from_millis(PAGE_HOLD_MS))
+                .await;
+            let _ = this.update(cx, |this, cx| {
+                let Some((t, _, _)) = this.empty_hold else {
+                    return;
+                };
+                if t == token {
+                    this.empty_hold = None;
+                    this.suppress_page_click = true;
+                    this.editing = true;
+                    this.edit = None;
+                    this.tile_menu = None;
+                    cx.notify();
+                }
+            });
+        })
+        .detach();
+    }
+
+    /// Leave tile editing mode and put the floating layers away.
+    fn exit_editing(&mut self, cx: &mut Context<Self>) {
+        if self.editing || self.edit.is_some() || self.tile_menu.is_some() || self.add_sheet {
+            self.editing = false;
+            self.edit = None;
+            self.tile_menu = None;
+            self.add_sheet = false;
+            cx.notify();
+        }
+    }
+
     fn pointer_move(&mut self, e: &MouseMoveEvent, cx: &mut Context<Self>) {
+        // A tile press-and-hold: small movements before it arms cancel it (that is
+        // just a click), movements after it arms turn the hold into a drag.
+        if let Some(hold) = self.tile_hold {
+            let dx = f32::from(e.position.x) - hold.start.0;
+            let dy = f32::from(e.position.y) - hold.start.1;
+            if hold.armed {
+                // GPUI starts a drag at ~2px; mirror that so the menu only opens
+                // when the press really stayed put.
+                if (dx.abs() > 2.0 || dy.abs() > 2.0)
+                    && let Some(active) = self.tile_hold.as_mut()
+                {
+                    active.moved = true;
+                }
+            } else if dx.abs() > 10.0 || dy.abs() > 10.0 {
+                self.tile_hold = None;
+            }
+        }
+        // A long press on empty space is cancelled by a scroll-sized movement.
+        if let Some((_, x, y)) = self.empty_hold {
+            let dx = f32::from(e.position.x) - x;
+            let dy = f32::from(e.position.y) - y;
+            if dx.abs() > 10.0 || dy.abs() > 10.0 {
+                self.empty_hold = None;
+            }
+        }
         if let Some(drag) = self.drag {
             self.apply_drag(drag, f32::from(e.position.x));
             cx.notify();
@@ -1617,8 +1853,25 @@ impl Metro {
         }
     }
 
-    fn pointer_up(&mut self, cx: &mut Context<Self>) {
+    fn pointer_up(&mut self, x: f32, y: f32, cx: &mut Context<Self>) {
         self.home_press = None;
+        self.empty_hold = None;
+        // Finish a tile press: a drag ends the selection, a long-press without a
+        // move opens the size menu where the finger let go.
+        if let Some(hold) = self.tile_hold.take()
+            && hold.armed
+        {
+            if hold.moved {
+                // Dragged: GPUI already suppresses the click that would follow.
+                self.edit = None;
+            } else {
+                // Long-pressed in place: this release opens the size menu, so the
+                // click that follows must not launch the app.
+                self.suppress_click = Some(hold.id);
+                self.tile_menu = Some(TileMenu { id: hold.id, x, y });
+            }
+            cx.notify();
+        }
         let was_slider = self.drag.take().is_some();
         if self.pulling {
             // Release: keep the panel if it was pulled far enough, else spring it back.
@@ -2314,6 +2567,371 @@ impl Metro {
         )
     }
 
+    // ── tile size menu (long-press a tile, release without moving) ──
+
+    fn tile_menu_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let menu = self.tile_menu?;
+        let tile = self.tiles.iter().find(|t| t.id == menu.id)?;
+        let app = &APPS[tile.app];
+        let fg = self.fg();
+        let width = 196.0;
+        let height = 232.0;
+        let x = menu.x.min(self.measured_w - width - 8.0).max(8.0);
+        let y = menu
+            .y
+            .min(self.vh - NAV_H - height - 8.0)
+            .max(STATUS_H + 8.0);
+        let tile_id = tile.id;
+
+        let sizes = [
+            (TileSize::Small, "Small"),
+            (TileSize::Medium, "Medium"),
+            (TileSize::Wide, "Wide"),
+            (TileSize::Large, "Full"),
+        ];
+        let mut rows: Vec<AnyElement> = Vec::with_capacity(sizes.len() + 1);
+        for (slot, (size, name)) in sizes.into_iter().enumerate() {
+            let current = tile.size == size;
+            rows.push(
+                div()
+                    .id(("menu-size", slot))
+                    .h(px(34.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .rounded(px(2.0))
+                    .cursor_pointer()
+                    .when(current, |d| d.bg(self.cell_bg()))
+                    .active(|s| s.opacity(0.6))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        if let Some(t) = this.tiles.iter_mut().find(|t| t.id == tile_id) {
+                            t.size = size;
+                        }
+                        this.tile_menu = None;
+                        this.save_soon(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(if current { fg } else { fg.opacity(0.85) })
+                            .child(name),
+                    )
+                    .when(current, |d| {
+                        d.child(div().text_size(px(13.0)).text_color(fg).child("✓"))
+                    })
+                    .into_any_element(),
+            );
+        }
+
+        let card = div()
+            .absolute()
+            .left(px(x))
+            .top(px(y))
+            .w(px(width))
+            .p(px(6.0))
+            .bg(self.panel_bg())
+            .rounded(px(2.0))
+            .border_1()
+            .border_color(fg.opacity(0.18))
+            .shadow_lg()
+            .occlude()
+            .flex()
+            .flex_col()
+            .child(
+                div()
+                    .px(px(8.0))
+                    .pt(px(4.0))
+                    .pb(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .child(
+                        div()
+                            .text_size(px(10.0))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(fg.opacity(0.55))
+                            .child("TILE SIZE"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(14.0))
+                            .font_weight(FontWeight::MEDIUM)
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(app.name),
+                    ),
+            )
+            .children(rows)
+            .child(div().h(px(1.0)).my(px(4.0)).bg(fg.opacity(0.12)))
+            .child(
+                div()
+                    .id("menu-unpin")
+                    .h(px(34.0))
+                    .px(px(8.0))
+                    .flex()
+                    .items_center()
+                    .rounded(px(2.0))
+                    .cursor_pointer()
+                    .active(|s| s.opacity(0.6))
+                    .child(
+                        div()
+                            .text_size(px(13.0))
+                            .text_color(fg.opacity(0.85))
+                            .child("Unpin from Start"),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.tiles.retain(|t| t.id != tile_id);
+                        this.tile_menu = None;
+                        this.edit = None;
+                        this.save_soon(cx);
+                        cx.notify();
+                    })),
+            );
+
+        let catcher = div()
+            .id("tile-menu-catcher")
+            .absolute()
+            .left(px(0.0))
+            .top(px(0.0))
+            .size_full()
+            .occlude()
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, _, _, cx| {
+                    this.tile_menu = None;
+                    cx.notify();
+                }),
+            );
+
+        Some(
+            div()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .size_full()
+                .child(catcher)
+                .child(card)
+                .into_any_element(),
+        )
+    }
+
+    // ── tile edit mode: bottom bar + Add sheet ──
+
+    fn edit_bar(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.editing || self.page != Page::Start {
+            return None;
+        }
+        let fg = self.fg();
+        let accent: Hsla = rgb(self.accent).into();
+        let ink = on_color(self.accent);
+
+        let step = |id: &'static str, label: &'static str, delta: f32| {
+            div()
+                .id(id)
+                .size(px(30.0))
+                .flex()
+                .items_center()
+                .justify_center()
+                .rounded(px(2.0))
+                .bg(self.cell_bg())
+                .cursor_pointer()
+                .active(|s| s.opacity(0.6))
+                .child(div().text_size(px(16.0)).text_color(fg).child(label))
+                .on_click(cx.listener(move |this, _, _, cx| {
+                    this.gap = (this.gap + delta).clamp(GAP_MIN, GAP_MAX);
+                    this.save_soon(cx);
+                    cx.notify();
+                }))
+        };
+
+        Some(
+            div()
+                .id("edit-bar")
+                .absolute()
+                .left(px(TILE_MARGIN))
+                .right(px(TILE_MARGIN))
+                .bottom(px(NAV_H + 10.0))
+                .h(px(54.0))
+                .px(px(12.0))
+                .flex()
+                .items_center()
+                .gap(px(8.0))
+                .bg(self.panel_bg())
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(fg.opacity(0.16))
+                .shadow_lg()
+                .occlude()
+                .child(
+                    div()
+                        .text_size(px(11.0))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(fg.opacity(0.6))
+                        .child("Gap"),
+                )
+                .child(step("gap-less", "−", -2.0))
+                .child(
+                    div()
+                        .w(px(42.0))
+                        .text_center()
+                        .text_size(px(12.0))
+                        .text_color(fg.opacity(0.85))
+                        .child(format!("{} px", self.gap.round() as u32)),
+                )
+                .child(step("gap-more", "+", 2.0))
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .id("edit-add")
+                        .h(px(34.0))
+                        .px(px(14.0))
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .rounded(px(2.0))
+                        .bg(accent)
+                        .cursor_pointer()
+                        .active(|s| s.opacity(0.7))
+                        .child(div().text_size(px(13.0)).text_color(ink).child("Add +"))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.add_sheet = !this.add_sheet;
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn add_sheet_layer(&self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        if !self.add_sheet || !self.editing || self.page != Page::Start {
+            return None;
+        }
+        let fg = self.fg();
+        let unpinned: Vec<usize> = (0..APPS.len())
+            .filter(|&i| !self.tiles.iter().any(|t| t.app == i))
+            .collect();
+
+        let mut items: Vec<AnyElement> = Vec::with_capacity(unpinned.len());
+        for i in unpinned {
+            let app = &APPS[i];
+            let hex = app.color.unwrap_or(self.accent);
+            items.push(
+                div()
+                    .id(("add-app", i))
+                    .w(px(72.0))
+                    .py(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .gap(px(6.0))
+                    .rounded(px(2.0))
+                    .cursor_pointer()
+                    .active(|s| s.opacity(0.6))
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.toggle_pin(i, cx);
+                        this.add_sheet = false;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .size(px(46.0))
+                            .rounded(px(3.0))
+                            .border_1()
+                            .border_color(fg.opacity(0.25))
+                            .bg(rgb(hex))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .child(glyph(app.icon, 22.0, on_color(hex))),
+                    )
+                    .child(
+                        div()
+                            .w_full()
+                            .text_size(px(11.0))
+                            .text_center()
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .child(app.name),
+                    )
+                    .into_any_element(),
+            );
+        }
+
+        let body: AnyElement = if items.is_empty() {
+            div()
+                .w_full()
+                .py(px(24.0))
+                .text_center()
+                .text_size(px(12.0))
+                .text_color(fg.opacity(0.55))
+                .child("Every app is already pinned")
+                .into_any_element()
+        } else {
+            div()
+                .w_full()
+                .flex()
+                .flex_wrap()
+                .gap(px(6.0))
+                .children(items)
+                .into_any_element()
+        };
+
+        Some(
+            div()
+                .id("add-sheet")
+                .absolute()
+                .left(px(TILE_MARGIN))
+                .right(px(TILE_MARGIN))
+                .bottom(px(NAV_H + 72.0))
+                .max_h(px(300.0))
+                .overflow_y_scroll()
+                .px(px(12.0))
+                .pt(px(10.0))
+                .pb(px(12.0))
+                .bg(self.panel_bg())
+                .rounded(px(2.0))
+                .border_1()
+                .border_color(fg.opacity(0.16))
+                .shadow_lg()
+                .occlude()
+                .flex()
+                .flex_col()
+                .gap(px(4.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(fg.opacity(0.6))
+                                .child("Add to Start"),
+                        )
+                        .child(
+                            div()
+                                .id("add-sheet-close")
+                                .size(px(26.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_full()
+                                .bg(self.cell_bg())
+                                .cursor_pointer()
+                                .active(|s| s.opacity(0.6))
+                                .child(glyph(IconName::X, 13.0, fg))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    this.add_sheet = false;
+                                    cx.notify();
+                                })),
+                        ),
+                )
+                .child(body)
+                .into_any_element(),
+        )
+    }
     // ── launch splash ──
 
     /// The coloured plate that grows from the tapped tile / card to the full page area,
@@ -2600,18 +3218,36 @@ impl Metro {
     }
 
     fn wallpaper_view(&self) -> Div {
-        let (from, to) = self.wallpaper_colors();
         let accent: Hsla = rgb(self.accent).into();
         let line = self.fg().opacity(0.05);
         let line_faint = self.fg().opacity(0.025);
 
-        div()
+        let base = div()
             .absolute()
             .left(px(0.0))
             .top(px(0.0))
             .size_full()
-            .overflow_hidden()
-            .bg(linear_gradient(
+            .overflow_hidden();
+
+        // A real wallpaper image (if one is selected) is cover-cropped behind a
+        // light accent wash and a scrim so the tiles' ink stays readable.
+        let base = if let Some(path) = &self.wallpaper_file {
+            base.bg(rgb(0x101010))
+                .child(img(path.clone()).object_fit(ObjectFit::Cover).size_full())
+                .child(div().absolute().size_full().bg(linear_gradient(
+                    135.0,
+                    linear_color_stop(accent.opacity(0.08), 0.0),
+                    linear_color_stop(accent.opacity(if self.dark { 0.26 } else { 0.14 }), 1.0),
+                )))
+                .child(div().absolute().size_full().bg(hsla(
+                    0.0,
+                    0.0,
+                    0.0,
+                    if self.dark { 0.28 } else { 0.10 },
+                )))
+        } else {
+            let (from, to) = self.wallpaper_colors();
+            base.bg(linear_gradient(
                 135.0,
                 linear_color_stop(rgb(from), 0.0),
                 linear_color_stop(rgb(to), 1.0),
@@ -2621,54 +3257,56 @@ impl Metro {
                 linear_color_stop(accent.opacity(0.0), 0.3),
                 linear_color_stop(accent.opacity(if self.dark { 0.22 } else { 0.16 }), 1.0),
             )))
-            .child(
-                div()
-                    .absolute()
-                    .top(px(-150.0))
-                    .right(px(-120.0))
-                    .size(px(430.0))
-                    .rounded_full()
-                    .bg(accent)
-                    .opacity(if self.dark { 0.09 } else { 0.07 }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(-180.0))
-                    .left(px(-140.0))
-                    .size(px(380.0))
-                    .rounded_full()
-                    .bg(accent)
-                    .opacity(if self.dark { 0.06 } else { 0.05 }),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .bottom(px(30.0))
-                    .right(px(-70.0))
-                    .size(px(220.0))
-                    .rounded_full()
-                    .border_1()
-                    .border_color(self.fg().opacity(0.06)),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(120.0))
-                    .left(px(-60.0))
-                    .w(px(560.0))
-                    .h(px(1.0))
-                    .bg(line),
-            )
-            .child(
-                div()
-                    .absolute()
-                    .top(px(168.0))
-                    .left(px(-60.0))
-                    .w(px(560.0))
-                    .h(px(1.0))
-                    .bg(line_faint),
-            )
+        };
+
+        base.child(
+            div()
+                .absolute()
+                .top(px(-150.0))
+                .right(px(-120.0))
+                .size(px(430.0))
+                .rounded_full()
+                .bg(accent)
+                .opacity(if self.dark { 0.09 } else { 0.07 }),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom(px(-180.0))
+                .left(px(-140.0))
+                .size(px(380.0))
+                .rounded_full()
+                .bg(accent)
+                .opacity(if self.dark { 0.06 } else { 0.05 }),
+        )
+        .child(
+            div()
+                .absolute()
+                .bottom(px(30.0))
+                .right(px(-70.0))
+                .size(px(220.0))
+                .rounded_full()
+                .border_1()
+                .border_color(self.fg().opacity(0.06)),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(120.0))
+                .left(px(-60.0))
+                .w(px(560.0))
+                .h(px(1.0))
+                .bg(line),
+        )
+        .child(
+            div()
+                .absolute()
+                .top(px(168.0))
+                .left(px(-60.0))
+                .w(px(560.0))
+                .h(px(1.0))
+                .bg(line_faint),
+        )
     }
 
     // ── theme ──
@@ -2944,7 +3582,6 @@ impl Metro {
     }
 
     // ── tiles ──
-
     fn face(&self, face: &Face, t: &Tile, ink: Hsla) -> Div {
         let app = &APPS[t.app];
         let s = self.scale;
@@ -3114,7 +3751,7 @@ impl Metro {
         entering: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> AnyElement {
         let t = &self.tiles[ix];
         let id = t.id;
         let (cw, ch) = t.size.cells();
@@ -3131,7 +3768,8 @@ impl Metro {
         let w = self.tween(id, "w", tw, window, cx);
         let h = self.tween(id, "h", th, window, cx);
 
-        let editing = self.edit == Some(id);
+        let selected = self.edit == Some(id);
+        let editing = self.editing || selected;
         let color_hex = APPS[t.app].color.unwrap_or(self.accent);
         let color = rgb(color_hex).opacity(self.tile_alpha);
         let ink = on_color(color_hex);
@@ -3164,17 +3802,25 @@ impl Metro {
             (Turn::Idle, 0.0)
         };
 
-        let circle_btn = |bid: &'static str, icon: IconName| {
+        // Edit controls scale with the tile so a small tile doesn't get huge buttons
+        // and a large tile doesn't get lost little ones.
+        let (btn, icon_px): (f32, f32) = match t.size {
+            TileSize::Small => (20.0, 11.0),
+            TileSize::Medium | TileSize::Wide => (26.0, 14.0),
+            TileSize::Large => (34.0, 18.0),
+        };
+        let inset = (btn * 0.18).max(3.0);
+        let circle_btn = |bid: (&'static str, usize), icon: IconName| {
             div()
                 .id(bid)
                 .absolute()
-                .size(px(26.0))
+                .size(px(btn))
                 .flex()
                 .items_center()
                 .justify_center()
                 .rounded_full()
                 .bg(ink)
-                .child(glyph(icon, 14.0, inverse))
+                .child(glyph(icon, icon_px, inverse))
         };
 
         let plate = div()
@@ -3182,13 +3828,13 @@ impl Metro {
             .size_full()
             .overflow_hidden()
             .bg(color)
-            .when(editing, |d| d.border_2().border_color(ink))
+            .when(selected, |d| d.border_2().border_color(ink))
             .child(content)
             .when(editing, |d| {
                 d.child(
-                    circle_btn("unpin", IconName::X)
-                        .top(px(4.0))
-                        .right(px(4.0))
+                    circle_btn(("unpin", id), IconName::X)
+                        .top(px(inset))
+                        .right(px(inset))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             this.tiles.retain(|t| t.id != id);
                             this.edit = None;
@@ -3198,9 +3844,9 @@ impl Metro {
                         })),
                 )
                 .child(
-                    circle_btn("resize", IconName::ArrowLeftRight)
-                        .bottom(px(4.0))
-                        .right(px(4.0))
+                    circle_btn(("resize", id), IconName::ArrowLeftRight)
+                        .bottom(px(inset))
+                        .right(px(inset))
                         .on_click(cx.listener(move |this, _, _, cx| {
                             if let Some(t) = this.tiles.iter_mut().find(|t| t.id == id) {
                                 t.size = t.size.next();
@@ -3212,7 +3858,7 @@ impl Metro {
                 )
             });
 
-        div()
+        let tile = div()
             .id(("tile", id))
             .absolute()
             .left(px(x))
@@ -3222,17 +3868,39 @@ impl Metro {
             .cursor_pointer()
             // Metro "press" feel: the tile shrinks while held
             .active(|s| s.p(px(5.0)))
-            .when(self.edit.is_some() && !editing, |d| d.opacity(0.7))
+            .when(self.edit.is_some() && !selected && !self.editing, |d| {
+                d.opacity(0.7)
+            })
             .on_mouse_down(
                 MouseButton::Right,
                 cx.listener(move |this, _: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.tile_menu = None;
                     this.edit = Some(id);
+                    this.editing = true;
                     cx.notify();
                 }),
             )
+            // Press-and-hold lifts the tile; dragging from there moves it, and
+            // releasing without moving opens the size menu.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |this, e: &MouseDownEvent, _, cx| {
+                    cx.stop_propagation();
+                    this.tile_menu = None;
+                    this.begin_tile_hold(id, f32::from(e.position.x), f32::from(e.position.y), cx);
+                }),
+            )
             .on_click(cx.listener(move |this, _, _, cx| {
-                if this.edit.is_some() {
+                if this.suppress_click == Some(id) {
+                    this.suppress_click = None;
+                    cx.stop_propagation();
+                    return;
+                }
+                if this.edit.is_some() || this.editing {
                     this.edit = None;
+                    this.save_soon(cx);
+                    cx.stop_propagation();
                     cx.notify();
                 } else {
                     // Zoom the tile open; the rest turnstile away.
@@ -3240,7 +3908,7 @@ impl Metro {
                 }
             }))
             // Drag to replace (edit mode only): ghost follows the pointer, target highlights.
-            .when(self.edit.is_some(), |d| {
+            .when(self.edit.is_some() || self.editing, |d| {
                 d.on_drag(
                     payload,
                     |p: &DraggedTile, _: Point<Pixels>, _: &mut Window, cx: &mut App| {
@@ -3253,7 +3921,26 @@ impl Metro {
                 this.drop_handled = true;
                 this.move_tile(d.id, id, cx);
             }))
-            .child(turnstile(plate, w, h, id, turn, delay))
+            .child(turnstile(plate, w, h, id, turn, delay));
+
+        // Windows Phone-style wiggle while the tiles are in edit mode. Tiles carry a
+        // per-tile phase so they do not sway in lockstep.
+        if self.editing {
+            let phase = id as f32 * 0.7;
+            tile.with_animation(
+                ("tile-wiggle", id),
+                Animation::new(Duration::from_millis(760))
+                    .repeat()
+                    .with_max_fps(30.0),
+                move |el, d| {
+                    let t = d * std::f32::consts::TAU + phase;
+                    el.left(px(x + t.sin() * 1.6))
+                },
+            )
+            .into_any_element()
+        } else {
+            tile.into_any_element()
+        }
     }
 
     // ── pages ──
@@ -3285,8 +3972,25 @@ impl Metro {
             .size_full()
             .overflow_y_scroll()
             .track_scroll(&self.start_scroll)
+            // Long-press on empty space (not on a tile — tiles stop propagation)
+            // enters tile edit mode.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(|this, e: &MouseDownEvent, _, cx| {
+                    if !this.editing && this.launch.is_none() {
+                        this.begin_empty_hold(f32::from(e.position.x), f32::from(e.position.y), cx);
+                    }
+                }),
+            )
             .on_click(cx.listener(|this, _, _, cx| {
-                if this.edit.is_some() {
+                if this.suppress_page_click {
+                    // This release ended the long press that entered edit mode.
+                    this.suppress_page_click = false;
+                    return;
+                }
+                if this.editing {
+                    this.exit_editing(cx);
+                } else if this.edit.is_some() {
                     this.edit = None;
                     cx.notify();
                 }
@@ -3301,7 +4005,7 @@ impl Metro {
             }))
             .child(
                 div()
-                    .pl(px(MARGIN))
+                    .pl(px(TILE_MARGIN))
                     .pt(px(8.0))
                     .pb(px(24.0))
                     .child(div().relative().w(px(grid_w)).h(px(grid_h)).children(tiles))
@@ -3581,6 +4285,46 @@ impl Metro {
             })
             .collect();
 
+        let wallpaper_images: Vec<_> = self
+            .wallpaper_files
+            .iter()
+            .enumerate()
+            .map(|(i, path)| {
+                let selected = self.wallpaper_file.as_deref() == Some(path.as_path());
+                let pick = path.clone();
+                let label = wallpaper_label(path);
+                div()
+                    .id(("wallpaper-file", i))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.wallpaper_file = Some(pick.clone());
+                        this.save_soon(cx);
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .w(px(92.0))
+                            .h(px(58.0))
+                            .overflow_hidden()
+                            .bg(self.cell_bg())
+                            .when(selected, |d| d.border_2().border_color(fg))
+                            .child(img(path.clone()).object_fit(ObjectFit::Cover).size_full()),
+                    )
+                    .child(
+                        div()
+                            .w(px(92.0))
+                            .text_size(px(12.0))
+                            .whitespace_nowrap()
+                            .text_ellipsis()
+                            .text_color(if selected { fg } else { fg.opacity(0.55) })
+                            .child(label),
+                    )
+            })
+            .collect();
+
         let swatches: Vec<_> = ACCENTS
             .iter()
             .enumerate()
@@ -3671,7 +4415,28 @@ impl Metro {
                     .child(pivot_header("Settings".into(), "Theme".into(), key))
                     .child(caption("Theme"))
                     .child(div().flex().gap(px(24.0)).children(themes))
-                    .child(caption("Wallpaper"))
+                    .child(caption("Wallpapers"))
+                    .child(
+                        div()
+                            .w_full()
+                            .flex()
+                            .flex_wrap()
+                            .gap(px(10.0))
+                            .when(self.wallpaper_files.is_empty(), |d| {
+                                d.child(
+                                    div()
+                                        .py(px(6.0))
+                                        .text_size(px(12.0))
+                                        .text_color(fg.opacity(0.5))
+                                        .child(format!(
+                                            "No images in {} — drop some in and reopen this page",
+                                            wallpaper_dir().display()
+                                        )),
+                                )
+                            })
+                            .children(wallpaper_images),
+                    )
+                    .child(caption("Gradient Presets"))
                     .child(
                         div()
                             .w_full()
@@ -3893,6 +4658,9 @@ impl Render for Metro {
         let switcher_layer = self.switcher_layer(window, cx);
         let launch_layer = self.launch_layer(width);
         let panel_layer = self.panel_layer(window, cx);
+        let edit_bar = self.edit_bar(cx);
+        let add_sheet = self.add_sheet_layer(cx);
+        let tile_menu = self.tile_menu_layer(cx);
 
         // While a pull or a slider drag is in progress, a transparent layer sits above the
         // (pointer-occluding) panel so the gesture keeps receiving move / up events.
@@ -3908,7 +4676,9 @@ impl Render for Metro {
                 }))
                 .on_mouse_up(
                     MouseButton::Left,
-                    cx.listener(|this, _: &MouseUpEvent, _, cx| this.pointer_up(cx)),
+                    cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                        this.pointer_up(f32::from(e.position.x), f32::from(e.position.y), cx)
+                    }),
                 )
         });
 
@@ -3925,7 +4695,9 @@ impl Render for Metro {
             }))
             .on_mouse_up(
                 MouseButton::Left,
-                cx.listener(|this, _: &MouseUpEvent, _, cx| this.pointer_up(cx)),
+                cx.listener(|this, e: &MouseUpEvent, _, cx| {
+                    this.pointer_up(f32::from(e.position.x), f32::from(e.position.y), cx)
+                }),
             )
             .child(self.wallpaper_view())
             .child(
@@ -3986,6 +4758,10 @@ impl Render for Metro {
             })
             // Sliding panel sits above the content but under the status bar.
             .when_some(panel_layer, |d, layer| d.child(layer))
+            // Tile edit affordances, size menu, then the gesture catcher.
+            .when_some(edit_bar, |d, bar| d.child(bar))
+            .when_some(add_sheet, |d, sheet| d.child(sheet))
+            .when_some(tile_menu, |d, menu| d.child(menu))
             .when_some(catcher, |d, c| d.child(c))
             .child(status_bar)
     }
@@ -4046,8 +4822,22 @@ mod tests {
     // brings a `test` macro that would shadow Rust's built-in `#[test]`.
     use super::{
         CONFIG_VERSION, Config, GAP_MAX, TILE_ALPHA_MIN, TileSize, WALLPAPER_NAMES, app_index,
-        default_tiles, load_config, save_config,
+        default_tiles, is_image_file, load_config, save_config, wallpaper_label,
     };
+
+    #[test]
+    fn image_file_detection_and_labels() {
+        use std::path::Path;
+        assert!(is_image_file(Path::new("a/b/Sunset.PNG")));
+        assert!(is_image_file(Path::new("x.jpeg")));
+        assert!(is_image_file(Path::new("x.webp")));
+        assert!(!is_image_file(Path::new("notes.txt")));
+        assert!(!is_image_file(Path::new("no-extension")));
+        assert_eq!(
+            wallpaper_label(Path::new("wallpapers/quiet-woods.png")),
+            "quiet-woods"
+        );
+    }
 
     #[test]
     fn default_tiles_reference_real_apps() {
