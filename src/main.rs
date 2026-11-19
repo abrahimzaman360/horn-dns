@@ -149,24 +149,12 @@ pub(crate) struct Metro {
     save_token: usize,
 }
 
-/// Bounds for the main (host) window that lands on the user's desktop:
-/// `WINDOW_WIDTH` wide, full usable screen height, centred horizontally. The
-/// height excludes taskbar/dock areas, so the bottom of the UI stays reachable.
+/// Restore bounds for the Lumia shell's fullscreen root window.
 fn main_window_bounds(cx: &App) -> Bounds<Pixels> {
-    let width = px(WINDOW_WIDTH);
-    match cx.primary_display() {
-        Some(display) => {
-            let screen = display.visible_bounds();
-            let x =
-                f32::from(screen.origin.x) + (f32::from(screen.size.width) - WINDOW_WIDTH) / 2.0;
-            Bounds {
-                origin: point(px(x), screen.origin.y),
-                size: size(width, screen.size.height),
-            }
-        }
-        // No display information (headless): fall back to a phone-proportioned window.
-        None => Bounds::centered(None, size(width, px(1064.0)), cx),
-    }
+    cx.primary_display()
+        .map(|display| display.bounds())
+        // No display information (headless): keep a sensible restore size.
+        .unwrap_or_else(|| Bounds::centered(None, size(px(1280.0), px(800.0)), cx))
 }
 
 fn main() {
@@ -176,12 +164,17 @@ fn main() {
         let bounds = main_window_bounds(cx);
         open_window(
             WindowOptions {
-                window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // The primary Metro window is the desktop shell, not an app window:
+                // ask the host compositor to put it on the entire display at startup.
+                window_bounds: Some(WindowBounds::Fullscreen(bounds)),
                 window_min_size: Some(size(px(320.0), px(480.0))),
                 titlebar: Some(TitlebarOptions {
-                    title: Some("Start".into()),
+                    title: Some("Lumia Shell".into()),
                     ..Default::default()
                 }),
+                app_id: Some("com.horn.lumia-shell".into()),
+                is_movable: false,
+                is_resizable: false,
                 ..Default::default()
             },
             cx,

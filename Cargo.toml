@@ -3,8 +3,29 @@ name = "horn"
 version = "0.1.0"
 edition = "2024"
 
+[[bin]]
+name = "horn"
+path = "src/main.rs"
+
+[[bin]]
+name = "horn-compositor"
+path = "src/bin/horn-compositor.rs"
+
 [dependencies]
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
 jiff = "1.0.1"
 gpui-kit = "0.10.0"
+
+# Wayland compositor (second binary). Keep the feature set minimal so it builds
+# without libinput/DRM system headers: the winit backend runs it nested inside
+# an existing Wayland session.
+smithay = { version = "0.7.0", default-features = false, features = [
+    "backend_winit",
+    "renderer_gl",
+    "renderer_glow",
+    "wayland_frontend",
+    "desktop",
+] }
+smithay-egui = "0.2.0"
+egui = "0.31.0"

@@ -22,7 +22,8 @@ pub(crate) const STATUS_H: f32 = 26.0; // status bar height (always the top laye
 pub(crate) const NAV_H: f32 = 52.0; // bottom navigation bar height
 pub(crate) const TILE_ALPHA_MIN: f32 = 0.30; // most transparent a tile may get
 pub(crate) const MAX_MANUAL_ROWS: u32 = 200; // limits corrupted configs from creating an unbounded canvas
-pub(crate) const WINDOW_WIDTH: f32 = 476.0; // main (host) window width; height fills the screen
+#[allow(dead_code)] // retained as a responsive-layout reference
+pub(crate) const WINDOW_WIDTH: f32 = 476.0;
 
 // Motion constants (ms)
 pub(crate) const LAUNCH_MS: u64 = 640; // whole launch splash (zoom + fade)
